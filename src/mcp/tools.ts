@@ -689,6 +689,7 @@ export function registerMcpTools(
                   "",
                   "The task is executing asynchronously; use poll_task to observe.",
                   `Call poll_task with taskId="${taskId}" to read incremental output and the terminal result.`,
+                  "Long-poll guidance: pass maxWaitMs=30000 so one poll_task call blocks until new output or a terminal state arrives (event-driven) instead of re-polling every few seconds.",
                 ].join("\n"),
               },
             ],

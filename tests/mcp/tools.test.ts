@@ -158,6 +158,23 @@ describe("mcp/tools protocol integration", () => {
     expect(reviewDescription).toContain("contextSessionIds");
   });
 
+  it("includes long-poll guidance in the background dispatch response", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Long-running background work",
+        background: true,
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("[Background Task Accepted]");
+    expect(content[0]?.text).toContain("maxWaitMs=30000");
+    expect(content[0]?.text).toContain("Long-poll guidance");
+  });
+
   it("compacts a source session over MCP and reports the summarized outcome (T2.3)", async () => {
     const source = await runner.delegateTask({ agent: "codex", task: "Seed compaction source" });
 
