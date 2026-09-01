@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { resolveAgentMeshHome } from "./session.js";
+import type { AgentMeshEventBus } from "./events.js";
 
 /**
  * T1.4 background task registry.
@@ -262,6 +263,8 @@ export interface BackgroundRegistryOptions {
   homeDir?: string;
   now?: () => number;
   isPidAlive?: (pid: number) => boolean;
+  /** Optional in-process bus; when absent the registry behaves exactly as before. */
+  eventBus?: AgentMeshEventBus;
 }
 
 export class BackgroundTaskRegistry {
@@ -269,6 +272,7 @@ export class BackgroundTaskRegistry {
   private readonly registryFile: string;
   private readonly now: () => number;
   private readonly pidAlive: (pid: number) => boolean;
+  private readonly _eventBus: AgentMeshEventBus | undefined;
   private readonly active = new Map<string, BackgroundTaskRecord>();
   private readonly released = new Set<string>();
   private readonly stalledNotified = new Set<string>();
@@ -284,6 +288,12 @@ export class BackgroundTaskRegistry {
     this.registryFile = path.join(this.tasksDir, "registry.jsonl");
     this.now = options.now ?? Date.now;
     this.pidAlive = options.isPidAlive ?? isPidAlive;
+    this._eventBus = options.eventBus;
+  }
+
+  /** The bus wired at construction, if any (read by the MCP notifier). */
+  public get eventBus(): AgentMeshEventBus | undefined {
+    return this._eventBus;
   }
 
   /**
@@ -330,6 +340,12 @@ export class BackgroundTaskRegistry {
     fs.appendFileSync(this.registryFile, `${JSON.stringify(record)}\n`, "utf-8");
     this.active.set(record.taskId, { ...record });
     this.ensureWatchdogTimer();
+    this._eventBus?.emit({
+      type: "task.started",
+      taskId: record.taskId,
+      outputFile: record.outputFile,
+      startedAtMs: record.startedAtMs,
+    });
   }
 
   /** Memory-first lookup with a registry.jsonl fallback (restart recovery). */
@@ -396,6 +412,12 @@ export class BackgroundTaskRegistry {
   public async writeStoredResult(result: StoredTaskResult): Promise<void> {
     fs.mkdirSync(this.tasksDir, { recursive: true });
     await fsp.writeFile(this.resultFilePath(result.taskId), JSON.stringify(result), "utf-8");
+    this._eventBus?.emit({
+      type: "task.completed",
+      taskId: result.taskId,
+      status: result.status,
+      exitCode: result.exitCode,
+    });
   }
 
   /** Tasks still tracked in this process without a stored terminal result. */
@@ -559,6 +581,7 @@ export class BackgroundTaskRegistry {
         this.stalledSince.set(taskId, nowMs);
         newlyStalled.push(taskId);
         this.watchdogConfig?.onStalled?.(taskId);
+        this._eventBus?.emit({ type: "task.stalled", taskId });
       }
     }
     if (this.active.size === 0) this.stopWatchdogTimer();
@@ -593,6 +616,9 @@ export class BackgroundTaskRegistry {
       Math.max(0, sinceOffset),
       MAX_POLL_READ_BYTES,
     );
+    if (read.content.length > 0) {
+      this._eventBus?.emit({ type: "task.output", taskId });
+    }
     // P-R15-1: a dead-lettered record means the owning bridge died without a
     // terminal result. That is NOT a task failure — surface the interruption
     // with the declared output path so the orchestrator can re-dispatch.
