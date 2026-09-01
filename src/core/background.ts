@@ -109,6 +109,12 @@ export interface PollTaskOptions {
   maxWaitMs?: number;
   intervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Event-driven wake hook (Plan 2026-09-01): resolves as soon as the task
+   * has activity (bus event or output-file change). When absent, pollTask
+   * keeps the legacy fixed-interval sleep loop — zero behavior change.
+   */
+  waitForActivity?: (taskId: string) => Promise<void>;
 }
 
 /** Raised when poll_task references a taskId unknown to memory and registry. */
@@ -606,6 +612,44 @@ export class BackgroundTaskRegistry {
     return this.released.has(taskId);
   }
 
+  /**
+   * Resolves once the task shows activity (Plan 2026-09-01): a lifecycle bus
+   * event, or any change to the output capture file — the vendor child writes
+   * that file directly, so an fs.watch is the only in-process "output arrived"
+   * signal. Internally time-bounded so the poller's own deadline logic stays
+   * in charge even when nothing happens.
+   */
+  public async waitForActivity(
+    taskId: string,
+    timeoutMs: number = WATCHDOG_INTERVAL_MS,
+  ): Promise<void> {
+    const record = this.getRegisteredTask(taskId);
+    let watcher: fs.FSWatcher | undefined;
+    let fileTimer: NodeJS.Timeout | undefined;
+    const fileChanged = new Promise<void>((resolve) => {
+      if (!record) return resolve();
+      try {
+        watcher = fs.watch(record.outputFile, { persistent: false }, () => resolve());
+        watcher.on("error", () => resolve());
+      } catch {
+        // Output file missing or unwatchable: bus/deadline path covers it.
+        return resolve();
+      }
+      fileTimer = setTimeout(() => resolve(), timeoutMs);
+      fileTimer.unref?.();
+    });
+    try {
+      if (this._eventBus) {
+        await Promise.race([this._eventBus.waitForEvent(taskId, timeoutMs), fileChanged]);
+      } else {
+        await fileChanged;
+      }
+    } finally {
+      if (fileTimer) clearTimeout(fileTimer);
+      watcher?.close();
+    }
+  }
+
   /** One poll step: status resolution plus incremental output read. */
   public async pollOnce(taskId: string, sinceOffset: number): Promise<PollTaskOutcome> {
     const record = this.getRegisteredTask(taskId);
@@ -668,7 +712,13 @@ export class BackgroundTaskRegistry {
     const deadline = Date.now() + maxWaitMs;
     let outcome = await this.pollOnce(options.taskId, options.sinceOffset ?? 0);
     while (outcome.status === "running" && Date.now() < deadline) {
-      await sleep(intervalMs);
+      if (options.waitForActivity) {
+        // Event-driven wake: the deadline still bounds the wall clock, so a
+        // never-firing hook cannot stretch the caller's poll.
+        await Promise.race([options.waitForActivity(options.taskId), sleep(intervalMs)]);
+      } else {
+        await sleep(intervalMs);
+      }
       outcome = await this.pollOnce(options.taskId, options.sinceOffset ?? 0);
     }
     return outcome;

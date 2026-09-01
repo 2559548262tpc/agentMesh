@@ -79,3 +79,66 @@ describe("BackgroundTaskRegistry event emission", () => {
     expect(outcome.status).toBe("running");
   });
 });
+
+describe("pollTask event-driven wake", () => {
+  it("wakes immediately on waitForActivity instead of sleeping the full interval", async () => {
+    const { registry } = makeRegistry();
+    const outputFile = registry.outputFilePath("t5");
+    registry.registerTask({
+      taskId: "t5",
+      pid: process.pid,
+      startedAtMs: Date.now(),
+      outputFile,
+    });
+    let wake: (() => void) | undefined;
+    const waitForActivity = () =>
+      new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+    // Real sleep resolves only after intervalMs; emulate that so the race is
+    // decided by the wake hook, not by an instantly-resolving mock.
+    const sleep = vi.fn(() => new Promise<void>(() => {}));
+    const pollPromise = registry.pollTask({
+      taskId: "t5",
+      sinceOffset: 0,
+      maxWaitMs: 5_000,
+      intervalMs: 60_000, // Without an event wake, one sleep eats the whole budget.
+      sleep,
+      waitForActivity,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10)); // let the loop enter its wait
+    // Simulate vendor completion → wake fires immediately.
+    await registry.writeStoredResult({
+      taskId: "t5",
+      status: "completed",
+      completedAtMs: Date.now(),
+    });
+    wake?.();
+    const startedAt = Date.now();
+    const outcome = await pollPromise;
+    // A legacy sleep(60000) loop would hang past the 5s deadline; the wake
+    // hook must return the terminal outcome almost immediately.
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(outcome.status).toBe("completed");
+    // sleep is invoked once as the losing race member and never re-looped.
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to sleep-polling when waitForActivity is absent", async () => {
+    const { registry } = makeRegistry();
+    const outputFile = registry.outputFilePath("t6");
+    registry.registerTask({
+      taskId: "t6",
+      pid: process.pid,
+      startedAtMs: Date.now(),
+      outputFile,
+    });
+    const outcome = await registry.pollTask({
+      taskId: "t6",
+      maxWaitMs: 30,
+      intervalMs: 10,
+      sleep: () => Promise.resolve(),
+    });
+    expect(outcome.status).toBe("running");
+  });
+});
