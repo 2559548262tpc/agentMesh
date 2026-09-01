@@ -1997,9 +1997,24 @@
         setupControls();
         renderRight();
         refresh();
-        setInterval(function () {
-          refresh();
-        }, 3000);
+
+        /* SSE push (Plan 2026-09-01): refresh on server-side change events.
+           A slow fallback interval remains for hosts/proxies that block SSE —
+           refresh() itself is idempotent, double-refresh is harmless. */
+        (function () {
+          var fallback = setInterval(refresh, 30000);
+          try {
+            var source = new EventSource("/api/events");
+            source.addEventListener("change", function () {
+              refresh();
+            });
+            source.onerror = function () {
+              /* EventSource auto-reconnects; the 30s fallback covers gaps. */
+            };
+          } catch (e) {
+            /* SSE unavailable in this environment; keep the 30s fallback. */
+          }
+        })();
       })();
     </script>
   </body>
