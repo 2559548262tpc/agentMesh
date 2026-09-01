@@ -12,6 +12,7 @@ import {
   readTailSnapshot,
 } from "../core/background.js";
 import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
+import { createAgentMeshEventBus } from "../core/events.js";
 import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
 import { defaultCheckpointStore } from "../core/checkpoint.js";
 import type { AgentMetadata } from "../core/config.js";
@@ -196,7 +197,9 @@ export class BackgroundDispatchService {
   >();
 
   constructor(
-    registry: BackgroundTaskRegistry = new BackgroundTaskRegistry(),
+    registry: BackgroundTaskRegistry = new BackgroundTaskRegistry({
+      eventBus: createAgentMeshEventBus(),
+    }),
     options: { checkpointStore?: typeof defaultCheckpointStore } = {},
   ) {
     this.registry = registry;
@@ -754,6 +757,9 @@ export function registerMcpTools(
         const outcome = await background.registry.pollTask({
           taskId: args.taskId,
           sinceOffset: args.sinceOffset,
+          // Event-driven wake (Plan 2026-09-01): a long maxWaitMs call now
+          // blocks until activity instead of sleep-polling every 100ms.
+          waitForActivity: (id) => background.registry.waitForActivity(id),
         });
         return {
           content: [

@@ -30,16 +30,56 @@ export interface McpServerOptions {
 const SHUTDOWN_FLUSH_BUDGET_MS = 10_000;
 
 /**
+ * Best-effort host notification on background-task terminal/stall events
+ * (Plan 2026-09-01). Uses the generic logging notification because
+ * notifications/progress is only valid within an in-flight request —
+ * delegate_task has already returned by the time a background task
+ * terminates. Hosts that do not surface logging messages to the model simply
+ * ignore these; long-polling poll_task remains the reliable observation
+ * mechanism.
+ */
+function attachBackgroundTaskNotifier(
+  server: McpServer,
+  background: BackgroundDispatchService,
+): void {
+  const bus = background.registry.eventBus;
+  if (!bus) return;
+  bus.subscribe((event) => {
+    if (event.type !== "task.completed" && event.type !== "task.stalled") return;
+    const data =
+      event.type === "task.completed"
+        ? `Background task ${event.taskId} ${event.status}. Call poll_task with taskId="${event.taskId}" to fetch the terminal result.`
+        : `Background task ${event.taskId} appears stalled (no output for a while). Inspect it with poll_task.`;
+    try {
+      void server.sendLoggingMessage({ level: "info", logger: "agentmesh", data }).catch(() => {
+        // Hosts may reject unsupported notifications; never crash the task.
+      });
+    } catch {
+      // Same posture: notification failure must not affect task execution.
+    }
+  });
+}
+
+/**
  * Creates and initializes the Multi-Agent Bridge MCP Server instance.
  */
 export function createMcpServer(options: McpServerOptions = {}): McpServer {
-  const server = new McpServer({
-    name: options.name || "agentmesh",
-    version: options.version || VERSION,
-  });
+  const server = new McpServer(
+    {
+      name: options.name || "agentmesh",
+      version: options.version || VERSION,
+    },
+    // Logging capability is required for sendLoggingMessage to actually emit
+    // (background-task notifications, Plan 2026-09-01); without it the SDK
+    // silently drops every logging message.
+    { capabilities: { logging: {} } },
+  );
 
   const runner = options.runner || defaultRunner;
   registerMcpTools(server, runner, { background: options.backgroundService });
+  if (options.backgroundService) {
+    attachBackgroundTaskNotifier(server, options.backgroundService);
+  }
 
   return server;
 }
