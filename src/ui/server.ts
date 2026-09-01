@@ -83,6 +83,58 @@ export function startUiServer(options: UiServerOptions = {}): Promise<UiServerHa
       return;
     }
 
+    // SSE change feed (Plan 2026-09-01): the ui process cannot share the MCP
+    // process's in-memory event bus, so a disk-watch is the honest bridge —
+    // fs.watch removes the panel's fixed 3s polling latency while disk stays
+    // the single source of truth. GET-only, 127.0.0.1-bound, read-only.
+    if (url.pathname === "/api/events" && method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      res.write(": connected\n\n");
+      let debounce: NodeJS.Timeout | undefined;
+      const fireChange = (): void => {
+        if (debounce) return;
+        debounce = setTimeout(() => {
+          debounce = undefined;
+          try {
+            res.write('event: change\ndata: {"sources":["sessions","tasks"]}\n\n');
+          } catch {
+            // Stream already torn down; the close handlers clean up the rest.
+          }
+        }, 200);
+      };
+      const watchers: Array<fs.FSWatcher> = [];
+      try {
+        watchers.push(fs.watch(path.join(homeDir, "tasks"), { persistent: false }, fireChange));
+      } catch {
+        // tasks dir may not exist yet; the homeDir watch still covers changes.
+      }
+      try {
+        watchers.push(fs.watch(homeDir, { persistent: false }, fireChange));
+      } catch {
+        // homeDir vanished: nothing left to watch.
+      }
+      const heartbeat = setInterval(() => {
+        try {
+          res.write(": hb\n\n");
+        } catch {
+          // ignore; the close handler clears everything
+        }
+      }, 15_000);
+      heartbeat.unref?.();
+      const cleanup = (): void => {
+        clearInterval(heartbeat);
+        if (debounce) clearTimeout(debounce);
+        for (const watcher of watchers) watcher.close();
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      return;
+    }
+
     handleUiApiRequest({
       method,
       pathname: url.pathname,
