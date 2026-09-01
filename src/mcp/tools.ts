@@ -635,6 +635,10 @@ export function registerMcpTools(
       "2. Parallelism: fan out read-only tasks (research/review/analysis) freely; strictly serialize write tasks that touch the same set of files.",
       "3. Continue-vs-fresh: send correction feedback back to the SAME session so error context carries over; run verification in a NEW session for fresh eyes; also start a new session when the direction was fundamentally wrong to avoid anchoring.",
       "4. Define done: an implementation task is done only when the report includes actual test results and a summary of changes made.",
+      "5. Dispatch mode: long tasks MUST use background:true — synchronous delegate calls die at the ~30s host cutoff, leave no task-registry record, and get no terminal binding in the visual board. Sync calls are only for quick queries (list_agents, get_session).",
+      "6. Handoff reference: review_changes and continue_task MUST pass contextSessionIds pointing at the upstream session(s). Without it the reviewer subtask cannot be attributed to its task in the board (orphan) and 'delivered context' is hallucinated, not audited.",
+      "7. Role closure: implementation tasks run worker → reviewer at minimum; never skip the reviewer. Dispatch a tester when acceptance requires independent execution evidence. Confirm the intended role on every dispatch.",
+      "8. Complexity gate: assess before dispatching — single-file cohesive changes are usually faster done directly by the orchestrator; MCP pays off when work splits into parallelizable packages with a fixed contract. Recording 'not worth dispatching' is a valid outcome.",
     ].join("\n"),
     DelegateTaskInputSchema.shape,
     async (args: z.infer<typeof DelegateTaskInputSchema>, extra) => {
@@ -849,7 +853,10 @@ export function registerMcpTools(
   // review_changes
   server.tool(
     "review_changes",
-    "Invokes an independent Reviewer Agent to inspect code changes, git diff, and report PASS / FAIL findings with line-level details",
+    [
+      "Invokes an independent Reviewer Agent to inspect code changes, git diff, and report PASS / FAIL findings with line-level details.",
+      "Always pass contextSessionIds referencing the reviewed worker session — without it the review cannot be attributed to its task in the visual board and the reviewer re-derives context from scratch.",
+    ].join("\n"),
     ReviewChangesInputSchema.shape,
     async (args: z.infer<typeof ReviewChangesInputSchema>, extra) => {
       try {

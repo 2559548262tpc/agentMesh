@@ -1259,6 +1259,19 @@ export class MultiAgentRunner {
 
       // Attach bridge session ID
       result.sessionId = session.id;
+
+      // v5 terminal binding: background dispatches stamp their taskId onto the
+      // session so the UI board can bind the terminal by fact, not by the
+      // time-proximity guess (see ORCHESTRATION.md §10). Stamped before
+      // recordTurn so the first durable flush carries the metadata.
+      if (params.taskActivity) {
+        const stampedMetadata = {
+          ...(session.metadata ?? {}),
+          bgTaskId: params.taskActivity.taskId,
+        };
+        this.sessionManager.updateSession(session.id, { metadata: stampedMetadata });
+        session.metadata = stampedMetadata;
+      }
       const repositoryAfter = await captureRepositoryState(effectiveCwd);
       if (role === "reviewer" && reviewerSafetyPolicy) {
         applyReviewerSafety(

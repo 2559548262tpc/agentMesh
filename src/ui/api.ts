@@ -10,6 +10,7 @@ import {
   readTaskOutput,
   readFile,
   buildTimeline,
+  buildTaskBoard,
   FileNotFoundError,
   NotAFileError,
   TaskNotFoundError,
@@ -71,6 +72,14 @@ export async function handleUiApiRequest(opts: {
   // -----------------------------------------------------------------------
   if (pathname === "/api/summary") {
     const data = await getSummary(homeDir, startDir);
+    return json(200, data);
+  }
+
+  // -----------------------------------------------------------------------
+  // /api/board — per-task aggregation
+  // -----------------------------------------------------------------------
+  if (pathname === "/api/board") {
+    const data = await buildTaskBoard(homeDir);
     return json(200, data);
   }
 

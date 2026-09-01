@@ -471,7 +471,22 @@ program
   .command("serve")
   .description("Start the stdio Model Context Protocol (MCP) server")
   .action(async () => {
-    await startMcpServer();
+    const server = await startMcpServer();
+    // Graceful shutdown closes the transport and aborts in-flight runs, but on
+    // Windows surviving vendor CLI grandchildren (.cmd wrappers) can keep the
+    // inherited stdio pipes open, so the event loop never drains and the serve
+    // process lingers forever (observed: 8 zombie processes on 2026-09-01).
+    // Wait for the server to close, then force exit. In-process tests use
+    // startMcpServer directly and never reach this CLI-scoped path.
+    await new Promise<void>((resolve) => {
+      const lowLevel = server.server;
+      const previousOnClose = lowLevel.onclose;
+      lowLevel.onclose = () => {
+        void previousOnClose?.call(lowLevel);
+        resolve();
+      };
+    });
+    process.exit(0);
   });
 
 // If executed without arguments in non-interactive environment (or piped stdin), start MCP server
