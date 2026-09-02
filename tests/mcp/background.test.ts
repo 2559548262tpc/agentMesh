@@ -225,6 +225,35 @@ describe("mcp background delegate and poll_task", () => {
     expect(payload.taskId).toBe("bgtask_does_not_exist");
   });
 
+  it("long-polls with maxWaitMs until the terminal result arrives in a single call", async () => {
+    const gate = new ReleaseGate();
+    adapter.gate = gate;
+    const taskId = await startBackgroundTask();
+    await waitFor(
+      () =>
+        fs.existsSync(outputFilePathOf(taskId)) &&
+        fs.readFileSync(outputFilePathOf(taskId), "utf-8").includes("started\n"),
+    );
+    // Terminal state lands well inside the long-poll budget, but after a
+    // short delay so the call must genuinely block on the event wake.
+    setTimeout(() => gate.open(), 300);
+
+    const startedAt = Date.now();
+    const res = await client.callTool({
+      name: "poll_task",
+      arguments: { taskId, maxWaitMs: 30_000 },
+    });
+    const outcome = JSON.parse((res.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      status: string;
+      result?: { summary?: string };
+    };
+    expect(outcome.status).toBe("completed");
+    expect(outcome.result?.summary).toBe("Background finished");
+    // One blocking call covered the gate delay; repeated client polls would
+    // each return early with "running".
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(200);
+  });
+
   it("aborts pending background tasks on graceful shutdown and records the outcome", async () => {
     adapter.gate = new ReleaseGate();
     const taskId = await startBackgroundTask();

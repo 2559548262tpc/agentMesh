@@ -624,7 +624,15 @@ export class BackgroundTaskRegistry {
     timeoutMs: number = WATCHDOG_INTERVAL_MS,
   ): Promise<void> {
     const record = this.getRegisteredTask(taskId);
+    // Lost-wakeup guard: arm the bus waiter BEFORE checking the stored result.
+    // writeStoredResult writes the result file and only then emits, so a
+    // completion landing before the check is already visible on disk, and one
+    // landing after is caught by the waiter armed below. A waiter orphaned by
+    // the fast path self-cleans via its own timeout and resolves harmlessly.
+    const busWaiter = this._eventBus?.waitForEvent(taskId, timeoutMs);
+    if (this.hasStoredResult(taskId)) return;
     let watcher: fs.FSWatcher | undefined;
+    let dirWatcher: fs.FSWatcher | undefined;
     let fileTimer: NodeJS.Timeout | undefined;
     const fileChanged = new Promise<void>((resolve) => {
       if (!record) return resolve();
@@ -632,21 +640,31 @@ export class BackgroundTaskRegistry {
         watcher = fs.watch(record.outputFile, { persistent: false }, () => resolve());
         watcher.on("error", () => resolve());
       } catch {
-        // Output file missing or unwatchable: bus/deadline path covers it.
-        return resolve();
+        // Output file missing or unwatchable: bus/dir/deadline path covers it.
+      }
+      try {
+        // Busless fallback: the terminal result lands in the tasks directory,
+        // not in the output file, so a directory watch is the only disk-level
+        // terminal signal. Spurious wakes from sibling tasks are harmless —
+        // the next pollOnce re-checks the real state.
+        dirWatcher = fs.watch(this.tasksDir, { persistent: false }, () => resolve());
+        dirWatcher.on("error", () => resolve());
+      } catch {
+        // Tasks dir unwatchable: bus/deadline path covers it.
       }
       fileTimer = setTimeout(() => resolve(), timeoutMs);
       fileTimer.unref?.();
     });
     try {
-      if (this._eventBus) {
-        await Promise.race([this._eventBus.waitForEvent(taskId, timeoutMs), fileChanged]);
+      if (busWaiter) {
+        await Promise.race([busWaiter, fileChanged]);
       } else {
         await fileChanged;
       }
     } finally {
       if (fileTimer) clearTimeout(fileTimer);
       watcher?.close();
+      dirWatcher?.close();
     }
   }
 
@@ -700,8 +718,11 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Polls until a terminal/stalled state or maxWaitMs elapse, sleeping
-   * intervalMs between attempts (default 100ms/500ms).
+   * Polls until a terminal/stalled state or maxWaitMs elapse. Without a
+   * waitForActivity hook it sleep-polls intervalMs between attempts
+   * (default 100ms/500ms); with one, the wait is event-driven — a single
+   * sleep of the remaining budget only serves as the deadline guard, so a
+   * long maxWaitMs call blocks until activity instead of re-polling.
    */
   public async pollTask(options: PollTaskOptions): Promise<PollTaskOutcome> {
     const intervalMs = options.intervalMs ?? POLL_INTERVAL_MS;
@@ -713,9 +734,10 @@ export class BackgroundTaskRegistry {
     let outcome = await this.pollOnce(options.taskId, options.sinceOffset ?? 0);
     while (outcome.status === "running" && Date.now() < deadline) {
       if (options.waitForActivity) {
-        // Event-driven wake: the deadline still bounds the wall clock, so a
-        // never-firing hook cannot stretch the caller's poll.
-        await Promise.race([options.waitForActivity(options.taskId), sleep(intervalMs)]);
+        // Event-driven wake: the remaining budget is the losing race member,
+        // so a never-firing hook cannot stretch the caller's poll.
+        const remainingMs = Math.max(deadline - Date.now(), 0);
+        await Promise.race([options.waitForActivity(options.taskId), sleep(remainingMs)]);
       } else {
         await sleep(intervalMs);
       }

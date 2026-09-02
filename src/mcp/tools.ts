@@ -438,6 +438,17 @@ export const PollTaskInputSchema = z.object({
       "Byte offset into the task output file; only new bytes past this offset are returned. " +
         "Pass nextOffset from the previous poll_task response",
     ),
+  maxWaitMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(60_000)
+    .optional()
+    .describe(
+      "Long-poll budget in milliseconds: the call blocks until new output or a terminal " +
+        "state arrives (event-driven), up to this ceiling. Recommended 30000; omit for a " +
+        "quick non-blocking status check",
+    ),
 });
 
 export const ReviewChangesInputSchema = z.object({
@@ -758,6 +769,7 @@ export function registerMcpTools(
         const outcome = await background.registry.pollTask({
           taskId: args.taskId,
           sinceOffset: args.sinceOffset,
+          maxWaitMs: args.maxWaitMs,
           // Event-driven wake (Plan 2026-09-01): a long maxWaitMs call now
           // blocks until activity instead of sleep-polling every 100ms.
           waitForActivity: (id) => background.registry.waitForActivity(id),
