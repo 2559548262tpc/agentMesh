@@ -4,6 +4,7 @@ import { InvalidArgumentError } from "commander";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import type { AgentMeshProjectConfig, ConfigParseIssue } from "../core/config.js";
 import { findProjectConfigPath, parseProjectConfigText } from "../core/config.js";
+import type { MetricsAggregate, MetricsGroupStats, MetricsWindow } from "../core/metrics.js";
 
 export const MAX_TIMEOUT_MS = 3_600_000;
 
@@ -25,6 +26,69 @@ export function parseTimeout(value: string): number {
     );
   }
   return timeout;
+}
+
+export function parseStatsWindow(value: string): MetricsWindow {
+  if (value === "all" || value === "24h" || value === "7d") return value;
+  throw new InvalidArgumentError("Window must be all, 24h, or 7d.");
+}
+
+const METRICS_TABLE_WIDTH = 100;
+
+function formatMetricsRate(ratio: number): string {
+  return `${(ratio * 100).toFixed(1)}%`;
+}
+
+function renderMetricsGroupTable(title: string, groups: MetricsGroupStats[]): void {
+  console.log(`\n${title}:`);
+  if (groups.length === 0) {
+    console.log("  (no dispatch records)");
+    return;
+  }
+  console.log(
+    "GROUP".padEnd(24) +
+      "TASKS".padEnd(8) +
+      "TOK IN".padEnd(12) +
+      "TOK OUT".padEnd(12) +
+      "P50 MS".padEnd(10) +
+      "P95 MS".padEnd(10) +
+      "RETRY".padEnd(9) +
+      "STALL".padEnd(9) +
+      "CANCEL",
+  );
+  console.log("-".repeat(METRICS_TABLE_WIDTH));
+  for (const group of groups) {
+    console.log(
+      group.key.padEnd(24) +
+        String(group.taskCount).padEnd(8) +
+        String(group.tokensIn).padEnd(12) +
+        String(group.tokensOut).padEnd(12) +
+        String(group.p50DurationMs).padEnd(10) +
+        String(group.p95DurationMs).padEnd(10) +
+        formatMetricsRate(group.retryRate).padEnd(9) +
+        formatMetricsRate(group.stallRate).padEnd(9) +
+        String(group.cancelCount),
+    );
+  }
+}
+
+/** Renders the `agentmesh stats` report; the full outcome breakdown lives in --json output. */
+export function renderMetricsReport(aggregate: MetricsAggregate): void {
+  console.log(
+    `\nAgentMesh Task Metrics (window: ${aggregate.window}, tasks: ${aggregate.taskCount})`,
+  );
+  if (aggregate.taskCount === 0 && aggregate.unattributedStallEvents === 0) {
+    console.log("\nNo task metrics recorded yet.\n");
+    return;
+  }
+  renderMetricsGroupTable("By model", aggregate.byModel);
+  renderMetricsGroupTable("By role", aggregate.byRole);
+  if (aggregate.unattributedStallEvents > 0) {
+    console.log(
+      `\nNote: ${aggregate.unattributedStallEvents} stall event(s) could not be attributed to a dispatch record.`,
+    );
+  }
+  console.log();
 }
 
 export function resolveRunInput(

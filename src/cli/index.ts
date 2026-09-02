@@ -6,13 +6,17 @@ import { startUiServer } from "../ui/server.js";
 import { VERSION } from "../version.js";
 import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
 import { runDoctorChecks } from "../core/diagnostics.js";
+import { aggregateTaskMetrics, readTaskMetrics } from "../core/metrics.js";
+import type { MetricsWindow } from "../core/metrics.js";
 import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
   parseMode,
   parseRole,
+  parseStatsWindow,
   parseTimeout,
   renderConfigValidationReport,
+  renderMetricsReport,
   resolveReviewInput,
   resolveRunInput,
   validateConfigFile,
@@ -50,6 +54,11 @@ interface ContinueCommandOptions {
 
 interface DoctorCommandOptions {
   json?: boolean;
+}
+
+interface StatsCommandOptions {
+  json?: boolean;
+  window?: MetricsWindow;
 }
 
 interface ConfigValidateCommandOptions {
@@ -402,6 +411,26 @@ program
       );
     }
     console.log();
+  });
+
+// Command: stats (read-only task metrics aggregation)
+program
+  .command("stats")
+  .description("Aggregate recorded task metrics by model and role over a time window")
+  .option("--window <window>", "Time window: all | 24h | 7d", parseStatsWindow, "all")
+  .option("--json", "Emit machine-readable JSON aggregates", false)
+  .action((options: StatsCommandOptions) => {
+    try {
+      const aggregate = aggregateTaskMetrics(readTaskMetrics(), { window: options.window });
+      if (options.json) {
+        console.log(JSON.stringify(aggregate, null, 2));
+      } else {
+        renderMetricsReport(aggregate);
+      }
+    } catch (err) {
+      console.error("Stats error:", err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
   });
 
 // Command: doctor (read-only aggregate diagnostics)

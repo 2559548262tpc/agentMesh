@@ -7,13 +7,16 @@ import {
   collectConfigSemanticIssues,
   parseMode,
   parseRole,
+  parseStatsWindow,
   parseTimeout,
   renderConfigValidationReport,
+  renderMetricsReport,
   resolveReviewInput,
   resolveRunInput,
   validateConfigFile,
 } from "../../src/cli/validation.js";
 import type { AgentNameResolver } from "../../src/cli/validation.js";
+import type { MetricsAggregate } from "../../src/core/metrics.js";
 
 describe("cli/validation", () => {
   it("accepts supported roles and modes", () => {
@@ -53,6 +56,99 @@ describe("cli/validation", () => {
     expect(resolveReviewInput("focus on auth", [], undefined, known)).toEqual({
       task: "focus on auth",
     });
+  });
+});
+
+describe("cli/stats", () => {
+  it("accepts supported windows and rejects others", () => {
+    expect(parseStatsWindow("all")).toBe("all");
+    expect(parseStatsWindow("24h")).toBe("24h");
+    expect(parseStatsWindow("7d")).toBe("7d");
+    expect(() => parseStatsWindow("30d")).toThrow("Window must be");
+    expect(() => parseStatsWindow("")).toThrow("Window must be");
+  });
+
+  const aggregate: MetricsAggregate = {
+    window: "24h",
+    taskCount: 3,
+    unattributedStallEvents: 2,
+    byModel: [
+      {
+        key: "gpt-5-codex",
+        taskCount: 2,
+        tokensIn: 300,
+        tokensOut: 120,
+        p50DurationMs: 1500,
+        p95DurationMs: 4000,
+        retryRate: 0.5,
+        stallRate: 1,
+        cancelCount: 1,
+        outcomes: { ok: 1, error: 1, stalled: 0, cancelled: 0, timeout: 0 },
+      },
+      {
+        key: "unknown",
+        taskCount: 1,
+        tokensIn: 0,
+        tokensOut: 0,
+        p50DurationMs: 0,
+        p95DurationMs: 0,
+        retryRate: 0,
+        stallRate: 0,
+        cancelCount: 0,
+        outcomes: { ok: 1, error: 0, stalled: 0, cancelled: 0, timeout: 0 },
+      },
+    ],
+    byRole: [
+      {
+        key: "worker",
+        taskCount: 3,
+        tokensIn: 300,
+        tokensOut: 120,
+        p50DurationMs: 1500,
+        p95DurationMs: 4000,
+        retryRate: 0.5,
+        stallRate: 1,
+        cancelCount: 1,
+        outcomes: { ok: 2, error: 1, stalled: 0, cancelled: 0, timeout: 0 },
+      },
+    ],
+  };
+
+  it("renders per-model and per-role tables with rates and the stall attribution note", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      renderMetricsReport(aggregate);
+      const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("AgentMesh Task Metrics (window: 24h, tasks: 3)");
+      expect(output).toContain("By model:");
+      expect(output).toContain("By role:");
+      expect(output).toContain("gpt-5-codex");
+      expect(output).toContain("50.0%");
+      expect(output).toContain("100.0%");
+      expect(output).toContain(
+        "Note: 2 stall event(s) could not be attributed to a dispatch record.",
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("renders an empty state when nothing has been recorded yet", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      renderMetricsReport({
+        window: "all",
+        taskCount: 0,
+        unattributedStallEvents: 0,
+        byModel: [],
+        byRole: [],
+      });
+      const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("No task metrics recorded yet.");
+      expect(output).not.toContain("By model:");
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 

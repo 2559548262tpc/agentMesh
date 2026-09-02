@@ -21,6 +21,8 @@ import {
 } from "./capabilities.js";
 import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
+import { appendTaskMetrics } from "./metrics.js";
+import type { TaskMetricsOutcome } from "./metrics.js";
 import { FREE_POOL_HINT, validateModelAgainstCatalog } from "./modelCatalog.js";
 import {
   detectDestructiveInstructions,
@@ -1434,6 +1436,8 @@ export class MultiAgentRunner {
         sharedContextText: sharedContext?.text,
         sharedContextSources: sharedContext?.sources,
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
+        effectiveModel: effectiveRequestedModel,
+        bgTaskId: params.taskActivity?.taskId,
       });
 
       // Post-execution water-level check: this turn's usage is now in the
@@ -2258,8 +2262,15 @@ export class MultiAgentRunner {
     sharedContextSources?: SourceRenderStats[];
     /** Overrides the derived cancel reason (e.g. server-shutdown disconnects). */
     cancelReason?: SessionExecutionEvidence["cancelReason"];
+    /** Effective requested model (explicit override or project default) for metrics grouping. */
+    effectiveModel?: string;
+    /** Background task id when this turn belongs to a background dispatch. */
+    bgTaskId?: string;
   }): void {
     const { session, result, repositoryBefore, repositoryAfter } = options;
+    const cancelReason =
+      options.cancelReason ??
+      (result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined);
     if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
       this.sessionManager.updateSession(session.id, {
         nativeSessionId: result.nativeSessionId,
@@ -2303,9 +2314,7 @@ export class MultiAgentRunner {
         durationMs: result.durationMs,
         timedOut: result.timedOut,
         aborted: result.aborted,
-        cancelReason:
-          options.cancelReason ??
-          (result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined),
+        cancelReason,
         errorCode: result.errorCode,
         cleanupMethod: result.cleanupMethod,
         cleanupSucceeded: result.cleanupSucceeded,
@@ -2327,6 +2336,47 @@ export class MultiAgentRunner {
         ? { contextSources: contextSourceIds(options.injectionSources) }
         : {}),
     });
+
+    // M0 metrics: one additive per-dispatch record derived from evidence this
+    // seam already holds (vendor usage, duration, cancel/timeout classification).
+    // Persistence follows the session storage directory, so non-persistent
+    // session managers (tests) record nothing and isolated storage paths
+    // relocate the metrics file together with the sessions file.
+    const metricsHome = this.sessionManager.storageDirectory;
+    if (metricsHome) {
+      const endedAtMs = Date.now();
+      const durationMs = result.durationMs ?? 0;
+      const outcome: TaskMetricsOutcome =
+        result.timedOut || cancelReason === "timeout"
+          ? "timeout"
+          : result.aborted ||
+              cancelReason === "client_cancel" ||
+              cancelReason === "client_disconnect" ||
+              result.errorCode === "CANCELLED"
+            ? "cancelled"
+            : result.status === "success"
+              ? "ok"
+              : "error";
+      appendTaskMetrics(
+        {
+          taskId: options.bgTaskId,
+          sessionId: session.id,
+          role: options.role,
+          agent: session.agent,
+          model: options.effectiveModel ?? options.requestedModel,
+          tokensIn: result.usage?.inputTokens ?? 0,
+          tokensOut: result.usage?.outputTokens ?? 0,
+          durationMs,
+          retries: 0,
+          stallEvents: 0,
+          cancelEvents: outcome === "cancelled" ? 1 : 0,
+          outcome,
+          startedAt: new Date(endedAtMs - durationMs).toISOString(),
+          endedAt: new Date(endedAtMs).toISOString(),
+        },
+        { homeDir: metricsHome },
+      );
+    }
   }
 
   /**

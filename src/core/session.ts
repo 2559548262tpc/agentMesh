@@ -251,6 +251,15 @@ export class SessionManager {
   }
 
   /**
+   * Directory holding the sessions storage file, or undefined when persistence
+   * is disabled. Sidecar stores (task metrics) co-locate here so an isolated
+   * storagePath in tests relocates them together with the sessions file.
+   */
+  public get storageDirectory(): string | undefined {
+    return this.persist ? path.dirname(this.storagePath) : undefined;
+  }
+
+  /**
    * Refreshes from disk while keeping sessions created in this process whose
    * first turn has not been flushed yet, so a deferred-create session stays
    * visible and is not clobbered by the storage reload.

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { resolveAgentMeshHome } from "./session.js";
+import { appendTaskMetrics } from "./metrics.js";
 import type { AgentMeshEventBus } from "./events.js";
 
 /**
@@ -588,6 +589,24 @@ export class BackgroundTaskRegistry {
         newlyStalled.push(taskId);
         this.watchdogConfig?.onStalled?.(taskId);
         this._eventBus?.emit({ type: "task.stalled", taskId });
+        // M0 metrics: the watchdog is the only stall observer, so it appends
+        // the stall event line (role/agent/model unknown at this point; the
+        // aggregator attributes it to the dispatch record via taskId).
+        appendTaskMetrics(
+          {
+            taskId,
+            outcome: "stalled",
+            stallEvents: 1,
+            tokensIn: 0,
+            tokensOut: 0,
+            durationMs: 0,
+            retries: 0,
+            cancelEvents: 0,
+            startedAt: new Date(record.startedAtMs).toISOString(),
+            endedAt: new Date(nowMs).toISOString(),
+          },
+          { homeDir: path.dirname(this.tasksDir) },
+        );
       }
     }
     if (this.active.size === 0) this.stopWatchdogTimer();

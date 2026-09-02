@@ -104,11 +104,14 @@ agentmesh list                  # 检查本机 Agent CLI 可用性
 agentmesh doctor [cwd]          # 只读聚合诊断（运行时/适配器/配置/能力矩阵/会话存储/仓库）
 agentmesh sessions              # 查看 Bridge Sessions
 agentmesh session <sessionId>   # 查看单个会话
+agentmesh stats                 # 任务度量聚合（按模型/角色/时间窗的消耗、耗时、stall/cancel 率）
 ```
 
 `agentmesh ui` 启动的面板是只读的可视化层：展示 Bridge Sessions、后台任务树与 Token 用量，数据全部来自磁盘上的 AgentMesh home 目录（`AGENTMESH_SESSIONS_FILE` 或 `~/.agentmesh`），与 MCP serve 进程不共享内存。面板通过 SSE 端点 `GET /api/events` 接收实时变更推送（UI 进程 `fs.watch` 数据目录，磁盘一有变化立即推送；SSE 不可用时自动降级为 30s 轮询），不再依赖固定间隔刷新。
 
 `doctor` 不执行任何任务、不消耗额度、不修改任何文件，把分散在 `list`、`config`、`sessions` 中的健康信息与交叉检查一次汇总：Node 版本、适配器可用性（被项目角色引用的缺失二进制会升级为 FAIL）、config schema 校验、Reviewer `safety: enforced` 与 `prompt-only` 适配器的矛盾组合、capabilities.json 版本漂移与无效文件、会话存储损坏/残留锁/隔离痕迹/容量水位、以及 cwd 的 Git 仓库状态。发现会在启动时必然失败的组合时以退出码 1 结束；`--json` 输出机器可读报告供 Orchestrator 或 CI 消费。
+
+`stats` 只读聚合 `<agentmeshHome>/metrics.jsonl` 中的任务级度量（随每次派发终态追加，stall 事件由后台 watchdog 单独记录并按 taskId 归因）：按模型与角色汇总任务数、Token 消耗、p50/p95 耗时、重试率、stall 率与取消数，`--window all|24h|7d` 选择时间窗、`--json` 输出机器可读报告。不执行任务、不消耗额度，供 Orchestrator 做数据驱动的路由与复盘。
 
 直接执行仅用于排查 MCP、适配器或 CLI 参数问题：
 
