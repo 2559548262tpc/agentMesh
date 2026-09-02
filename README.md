@@ -98,12 +98,15 @@ zcode           ZCode                              [MISSING]     CLI         Bin
 
 ```bash
 agentmesh serve                 # 启动 stdio MCP Server（通常由 Orchestrator 自动执行）
+agentmesh ui                    # 启动本地只读可视化面板（默认 http://127.0.0.1:7788）
 agentmesh config                # 查看并校验项目角色配置
 agentmesh list                  # 检查本机 Agent CLI 可用性
 agentmesh doctor [cwd]          # 只读聚合诊断（运行时/适配器/配置/能力矩阵/会话存储/仓库）
 agentmesh sessions              # 查看 Bridge Sessions
 agentmesh session <sessionId>   # 查看单个会话
 ```
+
+`agentmesh ui` 启动的面板是只读的可视化层：展示 Bridge Sessions、后台任务树与 Token 用量，数据全部来自磁盘上的 AgentMesh home 目录（`AGENTMESH_SESSIONS_FILE` 或 `~/.agentmesh`），与 MCP serve 进程不共享内存。面板通过 SSE 端点 `GET /api/events` 接收实时变更推送（UI 进程 `fs.watch` 数据目录，磁盘一有变化立即推送；SSE 不可用时自动降级为 30s 轮询），不再依赖固定间隔刷新。
 
 `doctor` 不执行任何任务、不消耗额度、不修改任何文件，把分散在 `list`、`config`、`sessions` 中的健康信息与交叉检查一次汇总：Node 版本、适配器可用性（被项目角色引用的缺失二进制会升级为 FAIL）、config schema 校验、Reviewer `safety: enforced` 与 `prompt-only` 适配器的矛盾组合、capabilities.json 版本漂移与无效文件、会话存储损坏/残留锁/隔离痕迹/容量水位、以及 cwd 的 Git 仓库状态。发现会在启动时必然失败的组合时以退出码 1 结束；`--json` 输出机器可读报告供 Orchestrator 或 CI 消费。
 
@@ -209,10 +212,12 @@ agentmesh capabilities show
 1. **`delegate_task`**
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
    - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `idempotencyKey` (可选), `background` (可选布尔值)。
-   - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
+   - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果（返回体附带长轮询指引）。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
 2. **`poll_task`**
    - 观察一个后台 delegate_task：返回 `status` (`running` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore` 以及终态时的 `result`。
-   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取)。单次调用内部以 100ms 间隔轮询、最长阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
+   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取), `maxWaitMs` (可选，0-60000，长轮询预算：调用在事件驱动下阻塞直到有新输出或终态，到达上限才返回；推荐 30000，省略则为快速非阻塞状态查询)。
+   - **事件驱动长轮询**：任务注册表持有进程内类型化事件总线（`task.started` / `task.output` / `task.completed` / `task.stalled`），长轮询调用在任务活动（事件或输出文件变化）时立即唤醒，而不是固定 100ms 盲轮询；预算上限仍然硬性约束墙钟时间。未指定 `maxWaitMs` 时单次调用内部最多阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
+   - **Best-effort 通知**：后台任务达到终态或被标记 stalled 时，MCP Server 会通过标准 `notifications/message`（logging 能力）向宿主推送一条提示（附 taskId 与下一步 poll 指引）。通知不保证送达——不支持或不上浮 logging 消息的宿主会静默忽略；可靠的观察机制始终是长轮询 `poll_task`。
 3. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
    - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。

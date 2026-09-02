@@ -644,3 +644,73 @@
 **状态**：封存（非 AgentMesh 缺陷，厂商无 headless 通道）。矩阵中 zcode 适配器保留（`zcode <prompt>` 薄封装），但不承诺可用；重启会话或厂商开放 headless 入口后重估。CLI 的 `zcode login` OAuth 流程可能建立 CLI 自己的凭据，是否绕开 WAF 未验证。
 
 **教训**：接入新 vendor 前先验证其 headless 通道在账号层是否可用（能力矩阵的"声明支持≠实际可用"缺口的账号级实例，参见 P-REAL-007 后续"矩阵粒度缺口"）。
+
+## P-065 仓库内 `.agentmesh/config.json` 污染 mcp/core 协议测试的角色解析路径
+
+**问题**：在仓库根新建 `.agentmesh/config.json`（声明 roles.worker/reviewer/tester）后，`tests/mcp/tools.test.ts`（3 例，如 400 行期望 "is not configured"）与 `tests/core/runner.test.ts`（1 例）持续失败；删除该文件后同批用例全部通过。失败集还会随并发负载漂移（background/idempotency/rollback/repository 在全量并发跑法下偶发），极易被误判为「基线既有问题」。
+
+**根因**：部分协议测试通过 `findProjectConfigPath` 向上查到真实仓库的 `.agentmesh/config.json` 并按其解析角色/升级链，测试期望的「未配置」前提被仓库级配置破坏；后台 worker 用 `git stash` 做基线对照时 untracked 的配置文件未被 stash，得出「与本次改动无关」的错误结论。
+
+**解决方法**：仓库内不留 `.agentmesh/config.json`（编排会话始终显式传 agent/model/role，不依赖角色解析默认值）；判定「基线既有失败」必须用移除 untracked 干扰物（`git stash -u` 或对照删除）后的重跑证据，不能只凭 stash。全量 `npm test` 在本机高负载下存在进程边界测试抖动，验收以「相关文件单独重跑全绿 + typecheck/lint 全绿」为准。
+
+**状态**：已解决（2026-09-01，配置文件已删除并以对照实验验证 18/18 与 48/48 通过）。
+
+## P-066 会话数据目录分裂导致面板「近几轮调用记录丢失」假象
+
+**问题**：面板启动后看不到近几轮真实调用（Token/模型全空），但 MCP 调用明明刚发生过。实际机器上同时存在 `C:\Users\25595\.agentmesh\sessions.json`（40 个旧会话）与 `F:\agentmesh-data\sessions.json`（38 个新会话）两套数据。
+
+**根因**：数据目录由 `AGENTMESH_SESSIONS_FILE` 环境变量决定（session.ts `resolveSessionStoragePath`），编排宿主进程设置了该变量指向 `F:\agentmesh-data`，而用户直接 `agentmesh ui` 的终端没有该变量，回退读 `~/.agentmesh`——双目录分裂使 UI 读到的不是「错数据」而是「另一套真数据」。
+
+**解决方法**：用户侧 `$env:AGENTMESH_SESSIONS_FILE="F:\agentmesh-data\sessions.json"`（或 SetEnvironmentVariable User 级）后重启终端；产品侧 v3 迭代给 `/api/board` 增加 `dataSource{homeDir,warnings}`，目录异常时页面顶部提示条显示**当前实际读取的目录全路径**，此类分裂一眼可见。注意环境变量只对新进程生效，已运行终端/IDE 需重启。
+
+**状态**：已解决（2026-09-01，v3 落地提示条并实测 homeDir 显示正确）。
+
+## P-067 预览到旧版面板：dist 陈旧 + 端口被孤儿 node 进程占用
+
+**问题**：v3 完成后启动面板，页面仍是 v2 逻辑（无 dataSource/groups 字段）；重建后仍如此。
+
+**根因**：两层叠加。① worker 各轮完成定义只含 typecheck/lint/单文件测试，不含 `npm run build`，`dist/` 停留在旧版本；② 7788 端口被中午启动的**孤儿 node 进程**占用——`StopCommand` 只终止了 trae-sandbox 包装层，node 子进程存活并继续监听，新实例被顶掉，探针打到旧进程上（`Get-NetTCPConnection -LocalPort 7788` 查到 12:11 启动的 PID）。
+
+**解决方法**：预览前强制 `npx tsup` 重建；重启面板前先查并清理端口占用进程（`Get-NetTCPConnection -LocalPort 7788 | Stop-Process -Id OwningProcess`）；判定「新代码是否生效」用 API 响应字段探针（如 `Object.keys(d)`），不用页面观感。验证 dist 新旧要防两种误判：esbuild 默认 ASCII charset 会把中文字符串转成 `\uXXXX` 转义（grep 中文恒不命中），应 grep 标识符（如 `inspectDataSource`）；PowerShell `Select-String -List` 对超大单行 bundle 可能漏报，用 `-Quiet` 逐文件循环。
+
+**状态**：已解决（2026-09-01，重建+杀孤儿进程后 API 探针确认 v3 字段齐全）。
+
+## P-068 免费评审员连续 stalled 与模型目录 ID 错误导致评审环节耗时膨胀
+
+**问题**：v4 返工后的复审用 `opencode/nemotron-3-ultra-free` 连续两次 stalled（各白等 2-3 个轮询周期）；换模型时又把「Ling 3.0 Flash Fin Free」错写成不存在的 `opencode/ling-3.0-flash`（正确 ID 为 `opencode/ling-3.0-flash-fin-free`），再耗一轮。评审环节全程浪费约 1 小时。
+
+**根因**：免费档 vendor 无稳定性 SLA，stalled 后原地重试同模型是无效路径；模型 ID 凭用户给的名称推断而未先查 catalog 已知可用池。
+
+**解决方法**：① 同一模型 stalled 一次即升级换人，从错误提示给出的 known-working free pool 里选（错误信息本身就带候选列表）；② 派发前核对模型 ID（`list_agents` 路由表或 catalog 错误提示），不凭名称意译；③ 轮询 stalled 任务不超过 2 个周期即处置，不空等。
+
+**状态**：已解决（2026-09-01，换 ling-3.0-flash-fin-free 后评审正常执行）。
+
+## P-069 并行编排会话共用工作区触发评审树守卫误伤
+
+**问题**：评审任务两次以「working tree changed during Reviewer execution」中止（一次 ORCHESTRATION.md、一次 vitest-report.json），但本会话评审期间并未改文件。后续排查发现另一并行会话在同一仓库做 v5 迭代（`src/core/runner.ts` 13 行改动、宪法 §9/§10、测试产物均为其产物）。
+
+**根因**：树变更守卫无法区分「评审员改树」与「第三方进程改树」；两个编排会话共享同一工作区时，任何一方的任何写入都会污染对方的评审证据链。
+
+**解决方法**：① 评审简报预置「并行改动排除清单」（明确列出 runner.ts/vitest-report.json/宪法新章节等归属，要求忽略非授权文件的变化继续得出结论）；② 绝不 `rollback_task` 非本会话的改动（rollback 会把工作树回滚到本会话锚点，毁掉并行会话工作）；③ 长期上同一仓库同时只跑一个编排会话，或用 git worktree 隔离。
+
+**状态**：已缓解（2026-09-01，排除清单方式跑通复审；仓库级隔离待执行）。
+
+## P-070 渲染级 CSS 契约在简报明确列出仍被执行偏差（v4 首轮评审 3 个 P1）
+
+**问题**：v4 简报已写明「分项列表顶部对齐」「padding 上下 16px 左右 20px」「角色无消耗显示 0」，worker 首轮仍交付了 `align-items:center`、`padding:16px`、全 0 提前 return 三处偏差，评审 FAIL 增加一轮返工。
+
+**根因**：自然语言布局描述与 CSS 取值之间存在转译损耗；worker 对「视觉已经差不多」的自我判断替代了逐条契约核对。
+
+**解决方法**：纯样式契约在简报中直接给出**选择器级**改动点（如「`.ring-wrap` 的 align-items 必须为 flex-start」），把自然语言转译工作留在组长侧一次性完成；worker 完成定义追加「按简报契约逐条自查 CSS 取值」；此类修复性返工不换人（上下文已在原会话）。
+
+**状态**：已缓解（2026-09-01，返工后 6 项全部落地并经组长逐项 grep 核验）。
+
+## P-071 serve 进程关闭后冗余留存：Windows vendor 孙进程管道保活导致僵尸堆积
+
+**问题**：每个 MCP 客户端会话各拉起一个 `agentmesh serve` stdio 进程；客户端断开后进程不退出，单机累积 8 个僵尸 serve 进程（2026-09-01 实测），持续占用内存并干扰测试（时间敏感的 poll 测试在僵尸进程并发活动下 waitFor 超时）。
+
+**根因**：`startMcpServer` 的 gracefulShutdown 正确关闭传输并 abort 在飞执行，但 `closeAndExit` 只设置 `process.exitCode = 0`，从不强制 `process.exit`，依赖事件循环自然排空。Windows 上 vendor CLI 以 `.cmd` shim 包装（cmd.exe → node 孙进程），abort 杀掉直接子进程后，孙进程仍持有继承的 stdio 管道句柄，父进程事件循环永不排空。启动时的 `scanAndReapOrphans` 只清扫任务注册表记录，不回收残留进程。
+
+**解决方法**：CLI `serve` action 在 `startMcpServer` 返回后挂接 `server.onclose`，服务关闭即 `process.exit(0)` 强制退出。修复放在 CLI 层而非 server.ts：进程内测试直接调用 `startMcpServer` 并复用真实关闭路径，强制退出会杀死 vitest 进程；CLI 路径为真实 serve 独占。测试运行前先清理僵尸进程（`Get-CimInstance Win32_Process | Where-Object CommandLine -match 'index\.js serve'` → `Stop-Process`）。
+
+**状态**：已修复并实证（2026-09-01，CLI 层强制退出；构建后真实起 serve 进程、断开 stdin，进程 5 秒内以退出码 0 自行终止）。
