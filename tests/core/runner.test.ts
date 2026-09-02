@@ -267,11 +267,31 @@ describe("core/runner", () => {
   });
 
   it("reports best-effort Reviewer protection without blocking prompt-only agents", async () => {
+    // Isolated clean repo: the guard must see no working-tree change regardless
+    // of whether the agentmesh checkout itself is dirty.
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-review-clean-"));
+    execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=AgentMesh Test",
+        "-c",
+        "user.email=agentmesh@example.invalid",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "initial",
+      ],
+      { cwd: projectRoot },
+    );
+
     const result = await runner.delegateTask({
       agent: "codex",
       task: "Review current changes",
       role: "reviewer",
-      cwd: process.cwd(),
+      cwd: projectRoot,
     });
 
     expect(result.status).toBe("success");
@@ -377,6 +397,118 @@ describe("core/runner", () => {
       });
       expect(result.findings?.at(-1)?.file).toBe("feature.ts");
       expect(fs.readFileSync(path.join(projectRoot, "feature.ts"), "utf8")).toContain("changed");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores out-of-scope working-tree changes when reviewPaths is set (P-R22-4)", async () => {
+    class ParallelNoiseReviewerAdapter extends MockAdapter {
+      override readonly name: AgentName = "claude";
+      private writes = 0;
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        if (!options.cwd) throw new Error("Test Reviewer requires cwd");
+        // Simulate a parallel worker / orchestrator writing an unrelated file
+        // while the review runs; the reviewer itself touches nothing in scope.
+        // Content differs per run so the second (unscoped) review detects it.
+        this.writes += 1;
+        fs.appendFileSync(
+          path.join(options.cwd, "PROGRESS.md"),
+          `- parallel orchestration artifact ${this.writes}\n`,
+        );
+        return super.runViaCli(options);
+      }
+    }
+    registry.register(new ParallelNoiseReviewerAdapter());
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-review-scope-"));
+
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      fs.writeFileSync(path.join(projectRoot, "feature.ts"), "export const value = 1;\n");
+      execFileSync("git", ["add", "feature.ts"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+
+      const result = await runner.reviewChanges({
+        agent: "claude",
+        cwd: projectRoot,
+        task: "Review without editing",
+        reviewPaths: ["feature.ts"],
+      });
+
+      expect(result.status).toBe("success");
+      expect(result.reviewerSafety).toMatchObject({ workspaceChanged: false });
+      expect(result.reviewerSafety?.warning).toContain("outside reviewPaths");
+
+      // Without reviewPaths the same out-of-scope write still fails the review
+      // (unchanged default semantics).
+      const unscoped = await runner.reviewChanges({
+        agent: "claude",
+        cwd: projectRoot,
+        task: "Review without editing",
+      });
+      expect(unscoped.status).toBe("failed");
+      expect(unscoped.error).toContain("working tree changed");
+      expect(unscoped.error).toContain("PROGRESS.md");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes .agentmesh/ from the reviewer tree guard by default (P-R21-4)", async () => {
+    class ConfigTouchingReviewerAdapter extends MockAdapter {
+      override readonly name: AgentName = "claude";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        if (!options.cwd) throw new Error("Test Reviewer requires cwd");
+        fs.mkdirSync(path.join(options.cwd, ".agentmesh"), { recursive: true });
+        fs.writeFileSync(path.join(options.cwd, ".agentmesh", "config.json"), '{"version":1}\n');
+        return super.runViaCli(options);
+      }
+    }
+    registry.register(new ConfigTouchingReviewerAdapter());
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-review-config-"));
+
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "--allow-empty",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+
+      const result = await runner.reviewChanges({
+        agent: "claude",
+        cwd: projectRoot,
+        task: "Review without editing",
+      });
+
+      expect(result.status).toBe("success");
+      expect(result.reviewerSafety).toMatchObject({ workspaceChanged: false });
+      expect(result.reviewerSafety?.warning).toContain(".agentmesh/");
     } finally {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }

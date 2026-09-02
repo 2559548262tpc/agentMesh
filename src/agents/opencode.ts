@@ -131,8 +131,12 @@ export class OpenCodeAdapter extends BaseAdapter {
     const args = ["run", prompt, "--format", "json"];
     if (options.model) args.push("--model", options.model);
     if (options.nativeSessionId) args.push("--session", options.nativeSessionId);
-    if (role === "reviewer") args.push("--agent", "plan");
-    else args.push("--auto");
+    // Reviewer read-only enforcement stays prompt-level (buildRolePrompt) plus
+    // the post-hoc tree guard in the runner. The vendor "plan" agent is NOT
+    // used: in non-interactive runs it dies as soon as it attempts a command
+    // (P-R21-1) and stalls with 0-byte output under parallel reviews
+    // (P-R22-2). `--auto` is the empirically stable form for every role.
+    args.push("--auto");
     // P3/T3.3: forward only allowlisted extraArgs; validation failures are
     // reported by runViaCli before any process is spawned.
     if (options.extraArgs && options.extraArgs.length > 0) {

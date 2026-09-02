@@ -408,6 +408,17 @@ export const DelegateTaskInputSchema = z.object({
   baseCommit: NonBlankString.optional().describe(
     "Optional git base branch/commit for diff comparison",
   ),
+  reviewPaths: z
+    .array(NonBlankString)
+    .min(1)
+    .max(50)
+    .optional()
+    .describe(
+      "Repo-relative paths (files or directories) a reviewer-role dispatch actually covers. " +
+        "Scoped tree guard: working-tree changes outside this set are reported as a warning " +
+        "instead of failing the review — use it when other workers commit in parallel (P-R22-4). " +
+        ".agentmesh/ is always excluded. Ignored for non-reviewer roles",
+    ),
   idempotencyKey: NonBlankString.max(200)
     .optional()
     .describe(
@@ -475,6 +486,17 @@ export const ReviewChangesInputSchema = z.object({
   baseCommit: NonBlankString.optional().describe(
     "Base branch/commit to diff against (e.g. 'main', 'HEAD~1')",
   ),
+  reviewPaths: z
+    .array(NonBlankString)
+    .min(1)
+    .max(50)
+    .optional()
+    .describe(
+      "Repo-relative paths (files or directories) the review actually covers. Scoped tree " +
+        "guard: working-tree changes outside this set are reported as a warning instead of " +
+        "failing the review — use it when other workers commit in parallel (P-R22-4). " +
+        ".agentmesh/ is always excluded",
+    ),
   mode: z
     .enum(["auto", "mcp", "cli"])
     .optional()
@@ -683,6 +705,7 @@ export function registerMcpTools(
                 contextSessionId: args.contextSessionId,
                 contextSessionIds: args.contextSessionIds,
                 baseCommit: args.baseCommit,
+                reviewPaths: args.reviewPaths,
                 idempotencyKey: args.idempotencyKey,
                 signal: mergeAbortSignals(extra.signal, signal),
                 taskActivity: { taskId, outputFile },
@@ -720,6 +743,7 @@ export function registerMcpTools(
             contextSessionId: args.contextSessionId,
             contextSessionIds: args.contextSessionIds,
             baseCommit: args.baseCommit,
+            reviewPaths: args.reviewPaths,
             idempotencyKey: args.idempotencyKey,
             signal: extra.signal,
           }),
@@ -897,6 +921,7 @@ export function registerMcpTools(
                 task: args.task,
                 cwd: args.cwd,
                 baseCommit: args.baseCommit,
+                reviewPaths: args.reviewPaths,
                 mode: args.mode,
                 timeoutMs: args.timeoutMs,
                 model: args.model,
@@ -930,6 +955,7 @@ export function registerMcpTools(
             task: args.task,
             cwd: args.cwd,
             baseCommit: args.baseCommit,
+            reviewPaths: args.reviewPaths,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
             model: args.model,

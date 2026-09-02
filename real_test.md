@@ -776,17 +776,57 @@ worker 一次修完全部 4 类缺陷，无 FAIL→continue 修复分支触发�
 
 ## 2. 真实阶段结果
 
-| 阶段                                                     | Agent/传输         | Session                                                     | 结果                                                                                                             | 耗时         |
-| -------------------------------------------------------- | ------------------ | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------------ |
-| Worker A（pointer.mjs，携带 model/reasoningEffort 探针） | codex/mcp          | `bridge-sess_faec245bdb99`                                  | SUCCESS，A1-A13 全过，finalAnswer 1397 字符                                                                      | 151.8s       |
-| Worker B（merge.mjs，**与 A 并行**）                     | codex/mcp          | `bridge-sess_920bd4115ab5`                                  | SUCCESS，A14-A18 全过，finalAnswer 801 字符                                                                      | 170.4s       |
-| Worker A turn2（patch.mjs，continue+`[B]` 注入）         | codex/cli 原生续接 | 同 A 会话                                                   | SUCCESS，A19-A36+R1/R2 全过，fa 2152 字符                                                                        | 240.8s       |
-| Tester 尝试 1–4                                          | antigravity/cli    | `6d4867358f33`/`ac8bb5255fce`/`d517e18dfa32`/`34ef0cc7821a` | FAILED×4，vendor 笼统 `Agent execution terminated due to error`（#1 消耗 5.5 万 token 后死亡，#2 零 token 即死） | 93/15/39/29s |
-| Reviewer 尝试 1                                          | opencode/cli       | `bridge-sess_e5a37d188e9a`                                  | FAILED，exit 124 超时 @900s（自建 base64 验证脚手架耗时过长），timedOut 证据完整                                 | 900.4s       |
-| Reviewer 尝试 2（加时+任务纪律修订后）                   | opencode/cli       | `bridge-sess_e09092ab7b4c`                                  | **PASS + 2 low 非阻塞 findings → SUCCESS/isError=false**，独立执行 76 项检查，fa 3344 字符                       | 502.8s       |
-| Tester 尝试 5                                            | antigravity/cli    | `bridge-sess_fb55586946cb`                                  | FAILED，**P9 致命形态**（见 §5），27.8 万 token 产出被清空                                                       | 313.3s       |
-| Tester 尝试 6（附 shell 写入降级指引）                   | antigravity/cli    | `bridge-sess_740af92778b5`                                  | SUCCESS，套件落盘工作区并运行，fa 4509 字符                                                                      | 287.5s       |
-| 终检（continue `[tester,reviewer]` 回流）                | codex              | A 会话 turn3                                                | SUCCESS，接受 finding1 为文档化歧义、以 tester 会话 ID 为据驳回 finding2，零改动，verdict PASS                   | 84.9s        |
+| 阶段                                                     | Agent/传输 | Session                    | 结果                                        | 耗时   |
+| -------------------------------------------------------- | ---------- | -------------------------- | ------------------------------------------- | ------ |
+| Worker A（pointer.mjs，携带 model/reasoningEffort 探针） | codex/mcp  | `bridge-sess_faec245bdb99` | SUCCESS，A1-A13 全过，finalAnswer 1397 字符 | 151.8s |
+| Worker B（merge.mjs，**与 A 并行**）                     | codex/mcp  | `bridge-sess_920bd4115ab5` | SUCCESS，A14-A18 全过，finalAnswer 801 字符 | 170.4s |
+
+---
+
+# 第二十二轮：多人点餐小程序全栈（多 worker × 多 reviewer × 多 tester，全 opencode 免费池，2026-09-02）
+
+**结论先行：业务目标达成——9 页前端 + 8 云函数 + 76 项单测 + 6 项对抗输入全绿，`node acceptance.test.js` 退出码 0（198/0），最终提交 45fd762（63 文件 / 4405 行）；测试目标达成——暴露 5 类新问题（P-R22-1~5），其中 review_changes 调用形态停滞与树守卫误伤两条直接指向 AgentMesh 产品侧改进。**
+
+## 1. 小任务是在做什么
+
+微信内部点餐小程序全栈：顾客侧 4 页（首页轮播/公告/点餐、购物车、我的订单、订单详情）+ 管理侧 5 页（菜品/订单/用户+背景/轮播/公告），8 个云函数（login/user/foods/orders/config/banner/notice/push_config），7 集合字段逐字对齐需求文档 §8。并行拆分：W1 用户登录、W2 点餐核心、W3 内容配置（云函数）+ W4/W5 前端，文件集互斥。评审链：R1 契约快审×3 → R2 云函数深审 + R3 前端深审×2（含增量复审）→ T1 对抗执行 + T2 终验。验收裁决：acceptance.test.js（worker 不可修改）+ node --test。
+
+## 2. 上下文是否损失及程度
+
+- **task 简报**：5 个 worker 简报全部自足（契约路径+章节号+独占文件集+验收命令），无 "based on your findings" 转引——无损。
+- **contextSessionIds**：R1 首派（review_changes 形态）带了 worker 会话但该批 0 字节弃置；R1 v2/R2/R3/T1/T2 均为独立简报派发，R1 v2 未带 contextSessionIds（re-derive from code），评审对象是代码本身故无信息损失，但面板归属少了一层（流程瑕疵，非信息损失）。
+- **上游→下游交接**：review findings 由组长摘录要点注入返工简报（medium/high 原文带文件:行），返工 worker 均按 finding 精确修复——交接有效。R2/R3 的 findings 未走 contextSessionIds 注入而是组长中继，属于"组长搬运"反模式的轻度使用（findings 短小，可接受）。
+- **总体评级：无损**（所有下游拿到的都是可独立工作的信息）。
+
+## 3. 是否重复做无意义操作
+
+- **必要独立复核**：组长 3 次跑 acceptance/单测（后端基线、返工中段、最终裁决门）——验收门职责，非重复。
+- **vendor 失败被迫重做**（真正的浪费，~4 次全量派发）：muse W4/W5 APIError 双弃（P-R22-1）→ ling 重派；W5 ling 两次截断（P-R22-3）→ 拆 3 小包补全；review_changes×3 弃置 → delegate_task 重派（P-R22-2）。
+- **无效重复**：无同参数重试（遵守止损纪律）。
+
+## 4. 暴露的问题
+
+| 编号    | 问题                                                                                                                             | 根因                                                                     | 影响                                              | 证据                                                                          | 建议                                                                                                                       |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| P-R22-1 | muse-spark-1.2-contributor-free 两包快速失败                                                                                     | vendor APIError（模型侧不可用）                                          | W4/W5 全量重做一次                                | result.json status=failed, error=APIError，output 恒 677B                     | 免费模型上货前先跑 1 个探针任务再批量派发                                                                                  |
+| P-R22-2 | review_changes+opencode 三路并行 0 字节停滞 ≥4min；同模型 delegate_task 正常                                                     | review_changes 调用形态问题（疑似 plan 模式 spawn/输出管道），非模型问题 | R1 首轮全废，~12 分钟窗口损失                     | 3 个 output 文件 12:50:17-29 启动后恒 0B；R1 v2 同模型流式正常                | 产品侧：修复 review_changes 的 opencode 适配；临时纪律：评审一律 delegate_task role=reviewer                               |
+| P-R22-3 | ling-3.0-flash-fin-free 长批量写文件任务两次截断：exitCode=0 但 finalAnswer 中途叙述，磁盘交付不完整（一次 0 文件、一次 3/5 页） | vendor 输出窗口截断，与 P-R21 同形态；任务粒度过大加剧                   | W5 三次派发才齐                                   | mtjm4v2l448eb25c / mtjmhn969fd48677 的 faTail 均为"Now creating..."式中途语   | 大批量文件写入按页拆小包（r22 已验证 3 小包全部成功）；终态检测应比对磁盘交付 vs 声称交付                                  |
+| P-R22-4 | 树守卫大面积误伤：R1×3、R2、R3-W4 全部 status=failed（working tree changed），但裁决文本有效                                     | 并行编排下其他 worker 写文件 + 组长写 PROGRESS.md 必然触发守卫           | 5 个评审 status 失真，需人工读 finalAnswer 裁决行 | 各评审 result.error="The working tree changed during Reviewer execution: ..." | 产品侧：树守卫限定受审路径集（excludePaths/onlyPaths）；编排纪律：评审期间冻结无关写任务不可行（牺牲并行度），应从守卫侧修 |
+| P-R22-5 | 验收静态检查要求页面 js 内含 reLaunch 字样，但守卫封装在 utils/role.js 内部导致 2 页误 FAIL                                      | 宪法验收标准未规定"守卫实现形态"，worker 用了语义等价但字面不匹配的封装  | 一次微修复返工                                    | acceptance FAIL 行：管理页跳转拦截 pages/admin/foods、pages/admin/orders      | 可执行 SPEC 要把"实现形态"写进契约（如：守卫必须页面内联）；或验收脚本改为语义检查                                         |
+
+## 5. 资源与清理
+
+- CPU/RSS/进程树：**未采集**（本轮未启用采样器）。
+- token 口径：全部 opencode 免费池（big-pickle/mimo-v2.5-free/nemotron-3-ultra-free/ling-3.0-flash-fin-free/muse-spark 尝试），无付费消耗；组长侧通过"文件大小监控 + sinceOffset 尾读"替代全量 poll，单次轮询上下文开销从 96KB 级降到 <2KB。
+- 清理：僵尸/弃置任务（muse×2、review_changes×3、W5 ling 首跑）无 cancel_task 可用，进程自然结束或留存 registry 记录；工作区最终状态已提交（45fd762）；对抗测试产物保留在 F:\agentmesh-r22\tmp\ 供复核；未记录凭据/完整环境变量。
+- 未覆盖项：90 帧流畅度、真机视觉、微信订阅消息真实下发（无开发者工具/appid，宪法 §2.4 已声明不可验证）；app.js 的 wx.cloud env 为占位符。
+  | Worker A turn2（patch.mjs，continue+`[B]` 注入） | codex/cli 原生续接 | 同 A 会话 | SUCCESS，A19-A36+R1/R2 全过，fa 2152 字符 | 240.8s |
+  | Tester 尝试 1–4 | antigravity/cli | `6d4867358f33`/`ac8bb5255fce`/`d517e18dfa32`/`34ef0cc7821a` | FAILED×4，vendor 笼统 `Agent execution terminated due to error`（#1 消耗 5.5 万 token 后死亡，#2 零 token 即死） | 93/15/39/29s |
+  | Reviewer 尝试 1 | opencode/cli | `bridge-sess_e5a37d188e9a` | FAILED，exit 124 超时 @900s（自建 base64 验证脚手架耗时过长），timedOut 证据完整 | 900.4s |
+  | Reviewer 尝试 2（加时+任务纪律修订后） | opencode/cli | `bridge-sess_e09092ab7b4c` | **PASS + 2 low 非阻塞 findings → SUCCESS/isError=false**，独立执行 76 项检查，fa 3344 字符 | 502.8s |
+  | Tester 尝试 5 | antigravity/cli | `bridge-sess_fb55586946cb` | FAILED，**P9 致命形态**（见 §5），27.8 万 token 产出被清空 | 313.3s |
+  | Tester 尝试 6（附 shell 写入降级指引） | antigravity/cli | `bridge-sess_740af92778b5` | SUCCESS，套件落盘工作区并运行，fa 4509 字符 | 287.5s |
+  | 终检（continue `[tester,reviewer]` 回流） | codex | A 会话 turn3 | SUCCESS，接受 finding1 为文档化歧义、以 tester 会话 ID 为据驳回 finding2，零改动，verdict PASS | 84.9s |
 
 边界探针（零额度，除取消探针约 20s）：伪 session 查询→结构化错误 ✓；跨仓 context→精确 cwd-mismatch 错误（9ms）✓；enforced 安全→fail-fast（9ms，完整 safety 报告，未启动 agent）✓；`contextSessionIds`(4)+`contextSessionId`(1)→runner 层上限错误 ✓；客户端取消→传播至调用方但留僵尸会话（见 §5）。
 
@@ -1601,3 +1641,62 @@ stdio 驱动独立桥接 serve 进程 → MCP `delegate_task(background:true, mo
 ### 本轮结论
 
 四迭代 9 次评审/返工闭环全部收敛，最终态 55 测试 + typecheck/lint/prettier 全绿，组长逐项 grep 核验 v4 六项修复落地。交接质量：简报侧与 diff 侧均无损，findings 人工中继为轻微损耗可接受。无效往返 5 次全部源于环境与操作失误而非链路缺陷，对应 5 条改进（P-R19-1~5）中 3 条为 AgentMesh 产品侧可实施项（评审排除参数、stalled 换道、模型 ID 候选返回），2 条为编排纪律（stalled 即换道、派发前核对 ID），已全部写入 PROBLEMS.md P-066~P-070 并在本轮后期开始执行。
+
+# 第二十一轮真实测试（2026-09-02）：编码正确率 × 用户体验双目标
+
+## 1. 小任务是在做什么
+
+- **业务目标**：在隔离临时 git 工作区 `F:\agentmesh-r21\workspace\mdtable`（唯一已有文件 SPEC.md）从零实现零依赖 CLI 工具 `mdtable`——Markdown 表格解析 + 按显示宽度（CJK=2）对齐渲染。SPEC.md 为唯一契约源，8 条行为契约逐条机器可核对。
+- **输入输出**：输入 SPEC.md 契约；输出 package.json / src/parse.js / src/format.js / src/cli.js / test/\*.test.js / sample.md，验收 = npm test ≥12 用例退出码 0 + CLI 对齐渲染 + 零依赖。
+- **分工**：worker（opencode/big-pickle）实现并自检 → reviewer（opencode，只读静态评审）给 PASS/FAIL + 行级 findings → 有界返工闭环（maxReworkRounds=3）→ tester（opencode/mimo-v2.5-free）独立运行验证。组长负责派发、监控、裁决。
+- **本轮主测能力**：编码正确率（worker 产出质量、reviewer 拦截能力、有界返工闭环是否真闭环）+ 用户体验（background 派发、长轮询 maxWaitMs、面板 live 上树、终端盖章绑定、面板聚合状态）。
+
+## 2. 上下文是否损失及程度
+
+- **worker → reviewer（contextSessionIds 注入）**：**无损**。最终 PASS 轮的 reviewer 独立读取了 SPEC 与全部交付文件，并对前两轮 findings 逐条复核（"Let me do a final review of the two known prior findings"），说明上游 findings 完整到达并可作为复核基准。
+- **reviewer → worker（返工 findings 注回）**：**无损**。面板 `mcpCalls[1]` 中可见返工任务文本完整携带 "# REWORK ROUND 1 OF 3" + "Reviewer summary" + "## Reviewer Findings (must all be resolved)" + Definition of done，结构化 findings 逐字注入，非转述。
+- **worker+reviewer → tester（双 contextSessionIds）**：**无损**。tester 对 reviewer 声称的两个修复逐条做了回归复现（4a/4b），并独立运行 19/19 测试——上下文到达且被批判性使用，而非照单全收。
+- **组长 → 面板（终端盖章绑定）**：**无损**。worker 子任务 `terminal.bgTaskId = bgtask_mtjfg5h380627bca / completed`，与派发返回的 taskId 精确匹配（盖章机制生效，非时间贪心 fallback）。
+- **等级结论**：规范化交接链路（task / summary / finalAnswer / findings / contextSources）本轮全部无损，Panel `contextSources` 归组正确（tester 会话正确挂入任务组 roles.tester）。
+
+## 3. 是否重复做无意义操作
+
+- **必要独立复核（不算重复）**：tester 全量复跑 npm test/CLI/回归——角色设计使然；组长对 tester Sample 2 对齐异常的抽检（复跑后确认所有行显示宽度均为 25，`テスト` 突出系片假名不在 SPEC 宽字符区段，SPEC 语义下无缺陷）——组长对 tester 拦截能力的抽验，成本一次 CLI 运行。
+- **无效重复（浪费）**：review 链 8 次派发仅 1 条链路干净走通——
+  1. 角色配置缺失导致首次派发即失败（组长 r21-3 声称建好 config.json 实际未建，操作性失误，非链路缺陷）；
+  2. nemotron-3-ultra-free 两次 0 字节停滞（>5min / >6min），两次全部废弃；
+  3. big-pickle 评审两次中途夭折（见 P-R21-1），分别浪费 5.3min 与 2min 的评审计算；
+  4. claude 通道 TLS 握手失败（无额度，用户明确弃用）；
+  5. 第 1 轮返工被树守卫误报触发（P-R21-4），整轮返工+复审做的是"无缺陷可修"的空转。
+- **结论**：无效重复 5 次，根因排序：评审适配层缺陷（2）> 免费模型停滞（2）> 编排操作失误（1）；无因上下文缺失导致的被迫重复。
+
+## 4. 暴露的问题（问题 / 根因 / 影响 / 证据 / 建议修复）
+
+| #       | 问题                                                                                                                                                           | 根因                                                                                                                                           | 影响                                                                                                                                                                           | 证据                                                                                                                                                                                                 | 建议修复                                                                                                                                                                                       |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-R21-1 | opencode 评审员（`--agent plan`）一旦尝试执行命令，整个会话提前终止：exitCode=0 但 status=failed，finalAnswer 是被截断的中途叙述，无 PASS/FAIL 裁决            | `src/agents/opencode.ts` L134：reviewer 强制走 plan agent（只读），非交互模式下工具被拒后会话直接结束；AgentMesh 把截断叙述当 finalAnswer 落盘 | 评审拦截能力被腰斩：评审员无法运行测试做执行级验证；4 次 opencode 评审 2 次死于该缺陷；且"执行失败"与"裁决 FAIL"语义混淆，面板把 6 个夭折评审全标成 FAIL verdict，误导排查方向 | mtjgb19605151475（02:03 结束，finalAnswer 止于 "Let me run npm test..."）；mtjgpal4bcff409a（02:14 结束，finalAnswer 止于 "Let me verify exit codes properly..."）；两次都恰好死在试图执行命令的瞬间 | plan 模式下会话无裁决结束时应记为 UNKNOWN 并支持续跑（continue_task 续命）而非 failed；评审简报模板前置声明"禁止执行命令，运行验证归 tester"；中期方案：为评审提供受限执行档（只允许只读命令） |
+| P-R21-2 | nemotron-3-ultra-free 评审停滞：进程存活但输出文件 0 字节 >5 分钟，且 MCP 层无任何取消后台任务的工具                                                           | 免费池模型无 SLA（r19 P-R19-5 重现）；工具面缺 cancel_task/stop_task                                                                           | 僵尸任务占用 + 组长只能放弃等待；停滞任务最终自生自灭（进程自行退出），期间 poll 一直返回 running                                                                              | mtjg3jv2ad530d97（0 字节 5.5min 后弃置）；mtjgcq4afb3c913d（0 字节 6min 后弃置）；rollback_task 需 sessionId 且语义是 git 回滚，无法用于取消                                                         | 增加 `cancel_task(taskId)`：杀进程树 + 落盘 cancelled 终态；stalled 状态出现即自动提示 nextCandidates（r19 P-R19-3 建议落地）                                                                  |
+| P-R21-3 | 评审/返工阶段后台任务输出文件全程 0 字节（worker 阶段正常流式 125KB JSONL），长轮询在评审期拿不到任何增量；返工闭环自主推进期间 poll_task 误报 `stalled`       | 评审/返工 run 的事件流未接入 output 文件写入路径；stalled 看门狗只看输出增长，不感知返工子阶段活动                                             | 组长在链路最复杂、最需要观测的阶段完全失明，只能靠进程扫描间接判断闭环推进；"stalled" 语义失真损害状态可信度                                                                   | bgtask_mtjgsw3455d2537e.output 从创建到完成始终 0 字节（mtime 停留在创建时刻）；02:24-02:33 期间 poll 两次返回 stalled，同期进程扫描可见 REWORK ROUND 1/2 与复审进程活跃                             | 评审/返工 run 复用 worker 的事件流管道写 output；stalled 判定纳入"子进程存活 + 子阶段活动"信号；返工期间状态应为 `reworking` 而非 stalled                                                      |
+| P-R21-4 | 树守卫误报：评审轮 0 的 FAIL findings 是 ".agentmesh/config.json 在评审期间被改动"（实为组长在派发间隙编辑的角色配置，且为未跟踪新文件），触发一整轮无意义返工 | 树守卫把派发前刚落盘的未跟踪文件变动纳入"评审期间变化"指纹；`.agentmesh/**` 未默认排除                                                         | 一轮返工 + 一轮复审全做无用功（约 8 分钟 + 数十万 token）；FAIL verdict 语义被污染                                                                                             | 面板 mcpCalls[1] 返工任务文本完整记载该 finding；config.json mtime 早于评审启动                                                                                                                      | `.agentmesh/**` 默认加入排除清单（r19 P-R19-1 的 excludePaths 机制存在但需默认化）；对纯配置类变动给出 acknowledge 提示而非 FAIL                                                               |
+| P-R21-5 | 面板状态不收敛：评审 PASS + tester PASS 后，worker 子任务与任务组状态永远停在 `running`                                                                        | worker 子任务状态推导未消费终态信号（最后一轮 mcpCall success + terminal.bgStatus=completed），多轮返工后无"最后一轮成功"的收敛逻辑            | 任务组终态失真，面板失去"一眼看结论"价值；组状态滚动规则（running > failed > ...）被永远 running 的 worker 拖死                                                                | 最终探针：groupStatus=running、worker status=running，而 lastFinishedAt=02:33:39(success)、terminal=completed；final PASS reviewer 子任务 status=passed                                              | worker 子任务终态 = f(最后 mcpCall 状态, terminal.bgStatus)；组状态推导在 worker 收敛后按最差态滚动                                                                                            |
+| P-R21-6 | verdict 推导两处失真：① 最终 PASS 评审 verdict 显示 UNKNOWN（PASS 出现在 finalAnswer 末尾而非前 200 字符）；② 6 个 vendor 截断的失败评审被标 FAIL verdict      | ① 200 字符窗口匹配规则太浅，对"叙述在前、裁决在后"的评审失效；② status=failed 直接映射 verdict=FAIL（ORCHESTRATION 聚合契约 v1 的已知缺陷）    | 检查结论卡片与真实裁决相反/缺失，用户需读全文才能知道结论                                                                                                                      | 探针 roles.reviewer[8]：status=passed 但 review.verdict=UNKNOWN；roles.reviewer[0..7] 全部 failed→FAIL                                                                                               | verdict 推导增加"末尾 500 字符 + 独立 PASS/FAIL 行"匹配；执行失败（无裁决文本）一律 UNKNOWN，仅评审明示 FAIL 才标 FAIL                                                                         |
+| P-R21-7 | 数据目录双轨：MCP 服务端实际数据根在 `F:\agentmesh-data`（env 注入），而 `~/.agentmesh/tasks/registry.jsonl` 为空壳只留历史残留                                | 环境变量决定数据根（P-066 家族），组长早期按 `~/.agentmesh` 排查扑空，浪费数分钟                                                               | 排查/监控脚本若按默认路径找注册表会扑空；双轨是会话分裂事故的持续隐患                                                                                                          | `~/.agentmesh/tasks/registry.jsonl` 0 字节且无 mtjfg5 之后记录；review_changes 返回的 OutputFile 指向 `F:\agentmesh-data\tasks\`                                                                     | 文档明示数据根解析顺序；面板/CLI 提供 `/api/whereami` 类自描述端点，报出实际数据根                                                                                                             |
+
+## 5. 资源与清理
+
+- **Token（面板聚合，全免费池模型）**：任务组合计 5,418,610 tok——worker 2,362,169（初实现 + 2 轮返工）；reviewer 9 会话合计约 2,560,399（其中 2 次停滞/夭折浪费约 757K，误报返工链约 634K）；tester 495,592。worker 单轮峰值 usageSplit（cached 653,824）说明缓存命中良好。
+- **进程**：两次弃置的停滞评审 opencode 进程（PID 14592 等）未经人工清理、最终自行退出（末次进程扫描已不在）；未发现孤儿 node 进程。本轮组长未做持续资源采样（CPU/RSS 未采集，不做零值虚报）。
+- **产物保留**：`F:\agentmesh-r21\workspace\mdtable`（git 仓库 + 8 交付文件 + .agentmesh/config.json）完整保留可复核；`F:\agentmesh-data\tasks\bgtask_*` 全部任务输出与结果文件在案。
+- **清理**：组长临时探针脚本（进程扫描/面板探针/对齐抽检样例）全部删除，未在仓库与临时工作区留下非交付文件。
+
+## 本轮结论与优化方向裁决
+
+**闭环验证结果：有界返工闭环真实闭环成立。** 完整链路 worker → reviewer FAIL → 自动返工 ×2 → reviewer PASS → tester PASS 全程自主推进无需人工中继：初审放过的 2 个真实崩溃级缺陷（居中列宽 1 时分隔行 RangeError；分隔行可能产出 0 个 `-`）在闭环内被拦截、修复并补上回归测试，测试从 14 → 19/19。这正是"编码正确率"提升的直接证据——闭环的价值不在首轮质量而在终态质量。
+
+**下一步优化优先级（编码正确率优先）：**
+
+1. **P0 — 评审适配层（P-R21-1/P-R21-3）**：评审员是正确率闭环的咽喉。plan 模式夭折 + 评审期零流式 + stalled 误报三件事叠加，使"评审"成为全链路最不可靠的环节（本轮 8 发 1 中）。修好它，闭环可靠性和观测性同时解决。
+2. **P1 — 终态语义（P-R21-5/P-R21-6）**：面板必须说真话——running 不收敛、UNKNOWN/FAIL 错标，直接损害用户对系统的信任，修复成本低收益高。
+3. **P1 — cancel_task（P-R21-2）**：stalled 检测已存在但缺"止损动作"，补取消工具即闭环。
+4. **P2 — 树守卫默认排除 `.agentmesh/**`（P-R21-4）\*\*：一行默认值，消除整轮浪费。
+5. **编排纪律沉淀**：派发前必查 cwd 下 `.agentmesh/config.json` 实存（r21-3 的教训）；免费评审模型 0 字节 2 分钟即弃（本轮后期已按此执行）。

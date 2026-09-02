@@ -101,6 +101,13 @@ export interface DelegateTaskParams {
   contextSessionIds?: string[];
   baseCommit?: string;
   /**
+   * Repo-relative paths (files or directories) a reviewer-role dispatch actually
+   * covers. Scoped tree guard: changes outside this set are disclosed as a
+   * warning instead of failing the review (P-R22-4 parallel-orchestration false
+   * positives). Ignored for non-reviewer roles.
+   */
+  reviewPaths?: string[];
+  /**
    * Internal: declares the strict review contract so an unparseable reviewer
    * verdict fails closed. Only the review_changes pipeline sets this; it is
    * deliberately absent from the MCP input schemas.
@@ -128,6 +135,12 @@ export interface ReviewChangesParams {
   task?: string;
   cwd?: string;
   baseCommit?: string;
+  /**
+   * Repo-relative paths (files or directories) the review actually covers.
+   * Scoped tree guard: changes outside this set are disclosed as a warning
+   * instead of failing the review (P-R22-4).
+   */
+  reviewPaths?: string[];
   mode?: TransportMode;
   timeoutMs?: number;
   model?: string;
@@ -535,21 +548,49 @@ function contextSourceIds(sources: BridgeSession[]): string[] | undefined {
   return usable.length ? usable : undefined;
 }
 
+/**
+ * Paths ignored by the reviewer tree guard by default: bridge-owned metadata
+ * that parallel orchestration legitimately rewrites mid-review (P-R21-4 /
+ * P-R22-4: role-config edits and board artifacts flipped PASS reviews to
+ * spurious "working tree changed" FAILs).
+ */
+const DEFAULT_REVIEW_GUARD_EXCLUSIONS = [".agentmesh/"];
+
+function normalizeScopedPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** Prefix/exact matcher over repo-relative paths; directories match their subtree. */
+function isPathWithinScope(filePath: string, scopes: readonly string[]): boolean {
+  const normalized = normalizeScopedPath(filePath);
+  return scopes.some((scope) => {
+    const candidate = normalizeScopedPath(scope);
+    return normalized === candidate || normalized.startsWith(`${candidate}/`);
+  });
+}
+
 function buildReviewerSafetyReport(options: {
   policy: ReviewerSafetyPolicy;
   mechanism: ReviewerSafetyReport["mechanism"];
   repositoryBefore?: RepositoryStateEvidence;
   repositoryAfter?: RepositoryStateEvidence;
   checkWorkspace?: boolean;
+  /**
+   * Repo-relative paths (files or directories) the review actually covers.
+   * When set, tree-guard failures are scoped to this set: out-of-scope changes
+   * (e.g. parallel workers committing elsewhere) are disclosed as a warning
+   * instead of failing the review (P-R22-4).
+   */
+  reviewPaths?: readonly string[];
 }): ReviewerSafetyReport {
   const repositoryCheckAvailable = Boolean(options.repositoryBefore && options.repositoryAfter);
-  const workspaceChanged =
+  const workspaceDirty =
     options.repositoryBefore && options.repositoryAfter
       ? options.repositoryBefore.fingerprint !== options.repositoryAfter.fingerprint
       : undefined;
   const beforePaths = options.repositoryBefore?.pathFingerprints;
   const afterPaths = options.repositoryAfter?.pathFingerprints;
-  const changedPaths = workspaceChanged
+  const rawChangedPaths = workspaceDirty
     ? beforePaths && afterPaths
       ? [...new Set([...Object.keys(beforePaths), ...Object.keys(afterPaths)])].filter(
           (filePath) => beforePaths[filePath] !== afterPaths[filePath],
@@ -560,8 +601,32 @@ function buildReviewerSafetyReport(options: {
             ...(options.repositoryAfter?.changedPaths || []),
           ]),
         ]
-    : undefined;
+    : [];
+  const defaultExcluded = rawChangedPaths.filter((filePath) =>
+    isPathWithinScope(filePath, DEFAULT_REVIEW_GUARD_EXCLUSIONS),
+  );
+  const visibleChangedPaths = rawChangedPaths.filter(
+    (filePath) => !isPathWithinScope(filePath, DEFAULT_REVIEW_GUARD_EXCLUSIONS),
+  );
+  const scopedChangedPaths = options.reviewPaths?.length
+    ? visibleChangedPaths.filter((filePath) => isPathWithinScope(filePath, options.reviewPaths!))
+    : visibleChangedPaths;
+  const outOfScopeCount = visibleChangedPaths.length - scopedChangedPaths.length;
+  // undefined = repository check unavailable; boolean = check ran (false when
+  // the tree is clean or every change fell outside the guard scope).
+  const workspaceChanged = workspaceDirty === undefined ? undefined : scopedChangedPaths.length > 0;
+  const changedPaths = workspaceChanged ? scopedChangedPaths : undefined;
   const warnings: string[] = [];
+  if (defaultExcluded.length > 0) {
+    warnings.push(
+      `${defaultExcluded.length} changed path(s) under .agentmesh/ were excluded from the workspace check by default.`,
+    );
+  }
+  if (outOfScopeCount > 0) {
+    warnings.push(
+      `${outOfScopeCount} changed path(s) outside reviewPaths were ignored by the workspace check (parallel-orchestration guard scoping).`,
+    );
+  }
   if (options.mechanism === "prompt-only") {
     warnings.push("This Reviewer relies on prompt-level constraints, not a runtime sandbox.");
   }
@@ -1281,6 +1346,7 @@ export class MultiAgentRunner {
             mechanism: adapter.sandboxMechanism,
             repositoryBefore,
             repositoryAfter,
+            reviewPaths: params.reviewPaths,
           }),
         );
       }
@@ -1447,6 +1513,7 @@ export class MultiAgentRunner {
         cwd: params.cwd,
         role: "reviewer",
         baseCommit: params.baseCommit,
+        reviewPaths: params.reviewPaths,
         mode: params.mode,
         timeoutMs: params.timeoutMs,
         model: params.model,

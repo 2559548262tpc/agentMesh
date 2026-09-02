@@ -714,3 +714,23 @@
 **解决方法**：CLI `serve` action 在 `startMcpServer` 返回后挂接 `server.onclose`，服务关闭即 `process.exit(0)` 强制退出。修复放在 CLI 层而非 server.ts：进程内测试直接调用 `startMcpServer` 并复用真实关闭路径，强制退出会杀死 vitest 进程；CLI 路径为真实 serve 独占。测试运行前先清理僵尸进程（`Get-CimInstance Win32_Process | Where-Object CommandLine -match 'index\.js serve'` → `Stop-Process`）。
 
 **状态**：已修复并实证（2026-09-01，CLI 层强制退出；构建后真实起 serve 进程、断开 stdin，进程 5 秒内以退出码 0 自行终止）。
+
+## P-072 opencode 评审员 `--agent plan` 在非交互模式下夭折与并行停滞（r21/r22 双证据）
+
+**问题**：opencode 评审员走 `--agent plan` 后两种失败形态：① 评审员一尝试执行命令整个会话提前终止（exitCode=0 但 finalAnswer 是截断的中途叙述，无 PASS/FAIL 裁决，r21 P-R21-1）；② `review_changes` 三路并行评审全部 0 字节输出停滞 ≥4 分钟，同模型常规形态正常（r22 P-R22-2）。
+
+**根因**：`src/agents/opencode.ts` 中 reviewer 角色被硬编码为 `--agent plan`（vendor 只读 agent）。plan agent 在非交互模式下对工具拒绝的处理是直接结束会话而非降级，且并行多实例下 spawn/输出管道不稳定；AgentMesh 又把截断叙述当 finalAnswer 落盘，"执行失败"与"裁决 FAIL"语义混淆。
+
+**解决方法**：opencode 所有角色统一 `--auto`（实测最稳形态），评审只读约束回归 prompt 层（buildRolePrompt 的 STRICT READ-ONLY + WORKSPACE CLEANLINESS 规则）+ runner 树守卫事后检测（sandboxMechanism 本就申报 prompt-only，诚实语义不变）。
+
+**状态**：已修复（2026-09-02，args.test.ts 回归用例断言 reviewer 参数含 `--auto` 且不含 `--agent plan`；r21 建议的"无裁决记 UNKNOWN + continue_task 续命"仍可作为后续增强）。
+
+## P-073 评审树守卫无法区分评审员改树与并行第三方改树（r22 P-R22-4 大面积误伤）
+
+**问题**：并行编排下 5 个评审任务全部 status=failed（"working tree changed during Reviewer execution"），但裁决文本有效；`.agentmesh/config.json` 等桥接自身元数据的合法改写也触发守卫（r21 P-R21-4 首次暴露），需人工读 finalAnswer 判断结论。
+
+**根因**：`buildReviewerSafetyReport` 对全树指纹做 before/after 比对，无法区分「评审员改树」与「并行 worker/组长改树」；守卫默认无范围概念，并行编排下误报是结构性的。
+
+**解决方法**：① `.agentmesh/` 前缀默认排除（桥接自身元数据）；② `review_changes` 与 `delegate_task`(role=reviewer) 新增 `reviewPaths` 参数（仓库相对路径，≤50 个）：设置后守卫只对受审路径集内的变更判 FAIL，范围外变更降级为 `reviewerSafety.warning` 披露；未设置时保持全树守卫语义（fail-closed 不变）。README 已同步。
+
+**状态**：已修复（2026-09-02，runner.test.ts 新增 2 个回归用例：范围外变更忽略 + `.agentmesh/` 默认排除；并修正既有用例对主仓库工作区脏状态的敏感性）。

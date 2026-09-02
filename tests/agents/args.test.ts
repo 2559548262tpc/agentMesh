@@ -281,8 +281,12 @@ describe("agents/args construction", () => {
     expect(reviewerArgs).toContain("json");
     expect(reviewerArgs).toContain("--session");
     expect(reviewerArgs).toContain("ses_12345678");
-    expect(reviewerArgs).not.toContain("--auto");
-    expect(reviewerArgs).toEqual(expect.arrayContaining(["--agent", "plan"]));
+    // P-R21-1 / P-R22-2: the vendor "plan" agent kills non-interactive reviewer
+    // runs (session death on command attempt; 0-byte stalls under parallel
+    // reviews). Every role now runs `--auto`; read-only enforcement is
+    // prompt-level plus the runner's post-hoc tree guard.
+    expect(reviewerArgs).toContain("--auto");
+    expect(reviewerArgs).not.toEqual(expect.arrayContaining(["--agent", "plan"]));
 
     expect(adapter.buildCliArgs({ task: "Implement", role: "worker" })).toContain("--auto");
   });

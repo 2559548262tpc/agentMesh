@@ -148,6 +148,8 @@ Reviewer 的 `safety` 支持：
 
 所有 Reviewer 都禁止调用者追加 `extraArgs`，避免覆盖固定的沙箱、工具或权限参数。AgentMesh 会比较 Reviewer 执行前后的仓库内容指纹；工作树在执行期间发生变化时，Review 会返回 `FAIL`、列出变更路径且不会自动回滚，以免覆盖用户的并发修改。该检测能发现误写，但 `best-effort` 本身不是操作系统级只读隔离。
 
+**树守卫范围限定（P-R22-4）**：`.agentmesh/` 下的变更默认排除（桥接自身元数据，并行编排期间合法改写）；`review_changes` 与 `delegate_task`(role=reviewer) 均支持 `reviewPaths`（仓库相对路径，文件或目录，最多 50 个）——设置后守卫只对受审路径集内的变更判 FAIL，范围外变更（如并行 worker 的提交）降级为 warning 并在 `reviewerSafety.warning` 中披露，不再污染评审结论。未设置 `reviewPaths` 时保持全树守卫语义。
+
 ```bash
 # 查看并校验当前生效配置
 agentmesh config
@@ -211,7 +213,7 @@ agentmesh capabilities show
 
 1. **`delegate_task`**
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
-   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `idempotencyKey` (可选), `background` (可选布尔值)。
+   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `reviewPaths` (可选，reviewer 角色的树守卫范围限定，见上文), `idempotencyKey` (可选), `background` (可选布尔值)。
    - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果（返回体附带长轮询指引）。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
 2. **`poll_task`**
    - 观察一个后台 delegate_task：返回 `status` (`running` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore` 以及终态时的 `result`。
@@ -220,7 +222,7 @@ agentmesh capabilities show
    - **Best-effort 通知**：后台任务达到终态或被标记 stalled 时，MCP Server 会通过标准 `notifications/message`（logging 能力）向宿主推送一条提示（附 taskId 与下一步 poll 指引）。通知不保证送达——不支持或不上浮 logging 消息的宿主会静默忽略；可靠的观察机制始终是长轮询 `poll_task`。
 3. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
-   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。
+   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `reviewPaths` (可选，树守卫范围限定，见上文), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。
    - **有界返工循环（P5）**：`maxReworkRounds > 0` 时，审查 FAIL 会自动把机器解析的结构化 findings 注入原 Worker 会话（`workerSessionId` 优先；未提供时若 `contextSessionIds` 中恰好只有一个 worker 角色会话则使用之，多个/零个候选时明示不猜），修复后再以全新 Reviewer 会话复审，最多 N 轮。评审提示词随严格契约附带 P0-P3 rubric（P0→critical、P1→high、P2→medium、P3→low；存在 P0/P1 即 FAIL）。轮次耗尽仍 FAIL 时返回完整逐轮证据链 `result.rework`；`maxReworkRounds=0` 与 v0.1 单轮行为完全一致。
 4. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
