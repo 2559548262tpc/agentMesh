@@ -4,6 +4,22 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### Planned (v0.4)
+
+- v0.4 改造方案已定稿于 [ROADMAP_v0.4.md](ROADMAP_v0.4.md)（外视角重构版），里程碑：
+  - M0 度量先行（任务级 metrics + reviewer 确认率 + 交接指纹）
+  - M1 fake-vendor 仿真 harness（人工压测故障类别全部进 CI）
+  - M2 模型健康度自动路由与自动止损（数据驱动，熔断 + 探针恢复）
+  - M3 评审价值度量与 findings 毕业（quick review 机器化，重复缺陷下沉为静态检查）
+  - M4 确定性编排状态机（声明式 WorkflowSpec + `run_workflow`/`get_workflow`，组长只在写 spec 与 ESCALATED 时介入）
+  - M5 安全默认翻转（默认 enforced 沙箱，prompt-only 需显式信任声明，预期 BREAKING）
+  - M6 统一数据层（SQLite 单一数据源，替代 JSONL 多源手工同步，可选）
+  - M7 生命周期原语与交接保真（优先级/依赖 DAG/暂停恢复 + `handoff_diff` 交接损失机器判定）
+
+## 0.3.0 - 2026-09-02
+
+v0.3 世代（五源融合优化计划 P1-P5）的完整实现。
+
 ### Added
 
 - **P5 unattended closed loop (T5.1-T5.5):**

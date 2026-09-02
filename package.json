@@ -1,6 +1,6 @@
 {
   "name": "agentmesh",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "AgentMesh: A lightweight bridge connecting orchestrator agents to native vendor coding agents (Codex, Antigravity, Grok, Claude Code, OpenCode, ZCode) via MCP and CLI",
   "author": "NevermeChu",
   "license": "MIT",
