@@ -243,7 +243,8 @@ WorkflowSpec（YAML/JSON，进仓库可审计）
 
 ### 改动点
 
-- `cancel_task` 已有（r21）。补齐：
+- `cancel_task`：~~已有（r21）~~ **M1 仿真 S3 证实尚未实现**（当前唯一取消原语是 transport close / graceful shutdown 的 abortAll），提前到 Wave 3 作为独立小任务落地（MCP 工具 + 进程树终止 + README/协议测试）。
+- 补齐：
   - **任务优先级**：队列排序 + 抢占策略。
   - **依赖 DAG**：task 增加 `deps: []` 字段，调度器并行运行就绪集（与 M4 的 parallelGroups 互补）。
   - **暂停/恢复**：以"取消 + continue_task 带规范化上下文恢复"实现（不假设 vendor 支持 SIGSTOP）。
