@@ -168,13 +168,17 @@ function checkProjectConfig(cwd: string, outcome: ConfigLoadOutcome): DoctorChec
   const roles = Object.entries(outcome.loaded.config.roles)
     .filter(([, assignment]) => assignment !== undefined)
     .map(([role]) => role);
-  return [
+  const checks = [
     check(
       "config.file",
       "pass",
       `${outcome.loaded.path} valid (${roles.length > 0 ? roles.join(", ") : "no roles assigned"})`,
     ),
   ];
+  for (const warning of outcome.loaded.warnings) {
+    checks.push(check(`config.${warning.field}`, "warn", warning.message));
+  }
+  return checks;
 }
 
 function reviewerSafetyChecks(

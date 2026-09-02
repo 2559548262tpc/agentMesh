@@ -304,6 +304,7 @@ describe("cli/config validate", () => {
       const { root, configPath } = createProject({
         version: 1,
         roles: { worker: "zcode", reviewer: { agent: "opencode" } },
+        allowPromptOnly: true,
         agents: {
           zcode: {
             tier: "weak",

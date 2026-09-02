@@ -106,6 +106,11 @@ agentmesh sessions              # 查看 Bridge Sessions
 agentmesh session <sessionId>   # 查看单个会话
 agentmesh stats                 # 任务度量聚合（按模型/角色/时间窗的消耗、耗时、stall/cancel 率）
 agentmesh health                # 模型健康度快照（健康分、计数、p50/p95 耗时、熔断隔离状态）
+agentmesh workflow run <spec.json> [--cwd path] [--json]
+                                # 确定性工作流：按 JSON spec 跑完 dispatch→acceptance→review→rework 全流程
+                                # 退出码 0=done / 1=failed / 2=escalated；--json 时进度走 stderr、终态快照走 stdout
+agentmesh workflow status <workflowId> [--json]
+                                # 读取最近一次持久化的工作流快照（只读，跨进程存活）
 ```
 
 `agentmesh ui` 启动的面板是只读的可视化层：展示 Bridge Sessions、后台任务树与 Token 用量，数据全部来自磁盘上的 AgentMesh home 目录（`AGENTMESH_SESSIONS_FILE` 或 `~/.agentmesh`），与 MCP serve 进程不共享内存。面板通过 SSE 端点 `GET /api/events` 接收实时变更推送（UI 进程 `fs.watch` 数据目录，磁盘一有变化立即推送；SSE 不可用时自动降级为 30s 轮询），不再依赖固定间隔刷新。
@@ -211,6 +216,36 @@ agentmesh capabilities show
 - `onExceed: "warn"`（默认）：达到上限只警告，不拦截；
 - `onExceed: "rejectNew"`：达到上限后**新**的 delegate_task 派发立即失败并返回 `error_code: BUDGET_EXHAUSTED`（附可行动指引），在途任务与 poll_task 观察完全不受影响——闸门只挡新派发，不掐正在跑的工作。被拒的派发不注册幂等键，修复预算配置或换新会话后即可重派。
 
+### 沙箱默认翻转（M5 · BREAKING）
+
+**BREAKING CHANGE**：自 v0.4 起，角色派发的沙箱默认值翻转——不再隐式依赖 prompt-only 通道，默认解析为
+目标适配器所能提供的最强沙箱。解析顺序（`resolveRoleSandboxLevel`）：
+
+1. **显式配置**：角色条目上的 `sandboxLevel`（如 `"worker": { "agent": "codex", "sandboxLevel": "tool-filtering" }`）
+   优先；未设置时读取 `agents` 元数据中该 agent 的 `sandboxLevel`。两者均为有意声明，按原样生效。
+2. **适配器能力默认**：两者均未设置时，取目标适配器 `sandboxMechanism` 声明的最强沙箱——
+   codex 为 `native-sandbox`，claude 为 `tool-filtering`，antigravity 在非 Windows 平台为 `native-sandbox`。
+3. **回退 + 警告**：适配器声明 `prompt-only`（opencode / grok / zcode，以及 Windows 上的 antigravity）
+   或能力未知时，保持既有 prompt-only 行为，但解析结果携带警告。
+
+**`allowPromptOnly` 确认标志**：`prompt-only` 仍可使用，但必须显式且知情。当派发解析为 `prompt-only`
+（显式选择或回退）且 config 根级未设置 `"allowPromptOnly": true` 时，config 校验返回 WARNING（非 error，
+不阻断加载），提示确认风险或改用真实沙箱通道；设置标志后校验干净通过。该标志只是风险确认，
+永远不会提升运行时保护——`prompt-only` 通道没有任何强制力，会照做任务文本中的任何指令（H5/H9 实证），
+不能视为沙箱。警告通过 `loadProjectConfig()`（`LoadedProjectConfig.warnings`）与
+`parseProjectConfigText()`（成功分支 `warnings`）暴露，`agentmesh config validate` 与 `doctor` 沿用
+既有 warning 呈现模式。
+
+**迁移说明（BREAKING）**：
+
+- `.agentmesh/config.json` 未声明 `sandboxLevel` 且角色指向 prompt-only 适配器（opencode/grok/zcode）的
+  下游：行为仍是 prompt-only，但会出现警告。请在 config 根级添加 `"allowPromptOnly": true` 显式确认，
+  或迁移到 codex（native-sandbox）/ claude（tool-filtering）。
+- 依赖"默认即 prompt-only"这一隐式事实做安全假设的下游：该假设从不成立且 v0.4 起默认翻转为最强
+  可用沙箱，请显式声明并确认。
+- 既有 `agents.*.sandboxLevel` 元数据语义不变，但参与解析优先级（仅次于角色级显式声明）。
+- Reviewer `safety: best-effort/enforced` 行为与"prompt-only 适配器不能视为运行时只读沙箱"的立场不变。
+
 ---
 
 ## 🔌 MCP Server 配置指南
@@ -228,27 +263,38 @@ agentmesh capabilities show
    - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取), `maxWaitMs` (可选，0-60000，长轮询预算：调用在事件驱动下阻塞直到有新输出或终态，到达上限才返回；推荐 30000，省略则为快速非阻塞状态查询)。
    - **事件驱动长轮询**：任务注册表持有进程内类型化事件总线（`task.started` / `task.output` / `task.completed` / `task.stalled`），长轮询调用在任务活动（事件或输出文件变化）时立即唤醒，而不是固定 100ms 盲轮询；预算上限仍然硬性约束墙钟时间。未指定 `maxWaitMs` 时单次调用内部最多阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
    - **Best-effort 通知**：后台任务达到终态或被标记 stalled 时，MCP Server 会通过标准 `notifications/message`（logging 能力）向宿主推送一条提示（附 taskId 与下一步 poll 指引）。通知不保证送达——不支持或不上浮 logging 消息的宿主会静默忽略；可靠的观察机制始终是长轮询 `poll_task`。
-3. **`review_changes`**
+3. **`cancel_task`**
+   - 主动取消一个运行中的后台任务：通过其 abort controller 走与 stalled 看门狗完全相同的终止路径（终止完整 vendor 进程树，Windows `taskkill /T /F`），先把输出尾部溢出为一次性 checkpoint（reason `cancelled`，可经 `continue_task` 的 `fromCheckpoint` 续跑），再落盘 `failed` 终态。
+   - 参数：`taskId` (必填), `reason` (可选，≤200 字符，记录进终态结果与 checkpoint，默认 `client_cancel`)。
+   - 已终态的任务是幂等 no-op（返回当前状态、无副作用）；未知 taskId 返回结构化 `NOT_FOUND`；属于其他活跃 bridge 进程（或已不在运行且无落盘结果）的任务返回 `NOT_CANCELLABLE`，不做跨进程操作。
+4. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
    - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `reviewPaths` (可选，树守卫范围限定，见上文), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。
    - **有界返工循环（P5）**：`maxReworkRounds > 0` 时，审查 FAIL 会自动把机器解析的结构化 findings 注入原 Worker 会话（`workerSessionId` 优先；未提供时若 `contextSessionIds` 中恰好只有一个 worker 角色会话则使用之，多个/零个候选时明示不猜），修复后再以全新 Reviewer 会话复审，最多 N 轮。评审提示词随严格契约附带 P0-P3 rubric（P0→critical、P1→high、P2→medium、P3→low；存在 P0/P1 即 FAIL）。轮次耗尽仍 FAIL 时返回完整逐轮证据链 `result.rework`；`maxReworkRounds=0` 与 v0.1 单轮行为完全一致。
-4. **`continue_task`**
+5. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
    - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000), `fromCheckpoint` (可选)。
    - **Checkpoint 续跑（P5）**：失败/被取消的后台任务与被看门狗终止的 stalled 任务会把输出尾部（≤32k 字符）溢出为一次性 checkpoint 工件（`<agentmeshHome>/checkpoints/`，记录 reason 与用量）。`fromCheckpoint` 消费该工件并把抢救内容注入本次续跑 prompt 头部；checkpoint 是**一次性消费令牌**——续跑提交前先落 consumed 墓碑（fail-closed），二次消费与未知 checkpointId 都会被结构化拒绝。codex 通道 SIGKILL 级崩溃的 finalAnswer 另由 rollout 文件 tail 抢救（T1.4 机制），两者互补。
-5. **`list_agents`**
+6. **`list_agents`**
    - 输出**路由表视图**（T4.2）：每个注册 Agent 一块——名称/别名/**实时可用性**（registry 扫描前置到本次调用）/传输模式/沙箱申报/**路由元数据**（`tier`、`costLevel`、`strengths`、`notGoodAt`、`notes`，来自 `.agentmesh/config.json` 的 `agents` 段；未配置显示 `unmetered` 而非报错）/**candidates 升级链视图**/最近能力诊断；`agents` 段中无法解析为二进制的档位变体（如 codex profile 档）单列展示。主模型读一次即可完成全部任务分配。
    - 参数：`cwd` (可选，用于定位最近的 `.agentmesh/config.json`，默认当前目录)。
-6. **`get_session`**
+7. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
-7. **`get_role_config`**
+8. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
    - 参数：`cwd` (可选，默认当前目录)。
-8. **`compact_context`**
+9. **`compact_context`**
    - 把每个来源 Session 的规范化历史压缩为一份语义摘要 sidecar：用该 Session 绑定的 Agent 以 worker 角色发起一轮禁工具摘要任务（八段结构：原始意图/关键技术概念/涉及文件与数据/错误与修复/全部用户指令/待办/当前状态/下一步；先 `<analysis>` 草稿再 `<summary>` 交付，交付前剥除草稿），摘要 ≤2000 tokens（超长截断并显式标注），末尾固定一行指向完整原文的指针。
    - 摘要写入源 Session 的 summary sidecar，**不改动其历史**；同一 Session 的并发 compact 调用会去重并返回进行中提示。
    - 参数：`sourceSessionIds` (必填，1-4 个 Bridge Session ID)。
+10. **`run_workflow`**
+    - 把一份声明式 JSON spec 交给进程内**确定性编排状态机**（M4）执行：每个 stage 派发 agent（worker/reviewer/tester 角色或 `parallelGroups` 并行包），执行验收命令 + 必需文件检查；reviewer stage 的 FAIL 会把结构化 findings 注入原 worker 会话（`continue_task`）并复审，直到 PASS 或轮次耗尽。流转全程无 LLM 参与；stage 派发走与 `delegate_task(background:true)` 相同的后台任务路径（registry 持久化、stalled 看门狗、`cancel_task` 全部继承），等待全事件驱动。
+    - 参数：`spec` (必填), `cwd` (可选，stage 派发与验收命令的目标目录)。spec：`name` + `stages[]`；每个 stage 声明 `roles` 或 `parallelGroups`（二选一）与 `dispatch`（`agent`、`mode`、`taskTemplate` 支持 `{{workflowName}}`/`{{stageName}}`/`{{group}}`/`{{upstreamSummaries}}` 占位符，`contextPolicy.contextSessionIds: "upstream"` 或显式数组 ≤4，`timeoutMs`），可选 `acceptance`（`commands[]` 顺序执行于 cwd，exit 0 = 通过；`files[]` 必须存在）与 `policy`（`maxReworkRounds` 0-3、`escalateOn: reviewFail|acceptanceFail|any`、`reRouteOnStall`，见下文"确定性编排状态机"）。
+    - 终态：`done`（全部 stage 通过）/ `escalated`（命中 `escalateOn` 的失败类——快照携带完整证据链：逐轮 findings、验收命令输出、仓库 diff 摘要；这是唯一回到 LLM Orchestrator/人类的点）/ `failed`（其余失败）。调用立即异步返回 `{workflowId}`，用 `get_workflow` 观察。
+11. **`get_workflow`**
+    - 返回工作流当前快照：总体状态、逐 stage 状态迁移、派发任务记录（stage 任务 ID 形如 `<workflowId>_s<stage>_<seq>`，可被 `poll_task`/`cancel_task` 直接观察）、验收命令结果、逐轮评审 verdict 与 findings、终态完整证据链。
+    - 参数：`workflowId` (必填), `maxWaitMs` (可选，0-60000 事件驱动长轮询，推荐 30000)。本进程持有的活跃工作流支持长轮询；其他（含已结束 bridge 进程启动的）工作流从持久化的 workflows.jsonl 日志读取最后一份快照（追加式 JSONL，损坏行跳过 fail-closed）。
 
 ### 配置到 MCP 客户端
 
@@ -278,7 +324,7 @@ delegate_task(role=tester, contextSessionIds=[Worker Session, Reviewer Session])
 continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Session], task=修复要求) → 原 Worker 会话一手接收全部反馈
 ```
 
-这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
+这段调用顺序由 Orchestrator 决定；AgentMesh 不会**隐式**自动编排这些调用，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。需要把固定不变的流转交给引擎时，可显式调用 `run_workflow`（见下文"确定性编排状态机"）——状态机只按显式 spec 执行，不替代 Orchestrator 的规划决策。
 
 ### 委派纪律（协议即提示词）
 
@@ -288,6 +334,39 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 2. **并行纪律**：只读任务（检查/评审/分析）可扇出并行执行；会写同一文件集合的写任务必须串行，避免互相踩踏。
 3. **continue-vs-fresh 决策表**：纠错类反馈用 `continue_task` 续同一会话（错误上下文天然延续）；验证/复审换新会话（fresh eyes，防锚定）；方向性全错同样换新会话，避免被旧思路带偏。
 4. **定义 done**：实现类任务的完成标准必须包含"回报测试结果与变更摘要"，缺任一项不算完成，不得验收。
+
+### 确定性编排状态机（run_workflow）
+
+r21/r22 真实测试轮实证：编排循环（拆解 → 派发 → 收结果 → 验收 → 复审 → 重派）中 90% 的流转是确定性的。`run_workflow` 把这个循环从外置 LLM Orchestrator 移入进程内状态机——Orchestrator 只在两个点被需要：**写 spec**、**处理 ESCALATED 升级**。这是显式选择，不是隐式行为：不调用该工具时，AgentMesh 的行为与此前完全一致。
+
+```json
+{
+  "name": "feature-x",
+  "stages": [
+    {
+      "name": "implement",
+      "roles": ["worker"],
+      "dispatch": { "taskTemplate": "实现 xxx，遵守 CONTRACT.md" },
+      "acceptance": { "commands": ["npm test"], "files": ["src/feature.ts"] }
+    },
+    {
+      "name": "review",
+      "roles": ["reviewer"],
+      "dispatch": { "taskTemplate": "独立审查本次变更" },
+      "policy": { "maxReworkRounds": 2 }
+    }
+  ]
+}
+```
+
+- **stage 形态**：`roles`（单派发，首项为执行角色）或 `parallelGroups`（互斥文件集并行包，每名一个并发派发，`{{group}}` 替换进 taskTemplate）二选一；`dispatch.contextPolicy.contextSessionIds: "upstream"` 把前序 stage 的 Bridge Session 一手注入本 stage。
+- **状态机**：每个 stage 走 `pending → dispatched → running → acceptance → review →（PASS → 下一 stage；FAIL → rework 环）`；终态 `done` / `escalated` / `failed`。
+- **验收即代码**："done 的定义"从纪律变成引擎行为：`acceptance.commands`（exit 0 = 通过）与 `acceptance.files`（必须存在）由引擎直接执行，验收失败即按 `escalateOn` 分级终止并附命令 stdout/stderr 证据。
+- **rework 环（fail-closed）**：reviewer stage 的 FAIL findings 由引擎通过 `continue_task` 注入原 worker 会话，修复后以 `review_changes` 严格契约复审；无 verdict（UNKNOWN）不放行。轮次耗尽仍 FAIL → `escalated`（唯一回到 LLM Orchestrator/人类的点），快照携带逐轮 findings 与修复结果。
+- **继承后台任务基建**：stage 派发是货真价实的后台任务——registry 持久化、stalled 看门狗（30 分钟无输出自动终止 + checkpoint 溢出）、`cancel_task`、`poll_task` 增量输出全部可用，任务 ID 形如 `<workflowId>_s<stage>_<seq>`。stall 类失败且 `policy.reRouteOnStall` 时按 M2 健康度候选链重派。
+- **事件驱动**：引擎等待全部基于事件总线与输出文件变化唤醒，零固定间隔轮询；`get_workflow` 的 `maxWaitMs` 提供事件驱动长轮询。
+- **持久化**：每次状态更新追加一行快照到 `<agentmeshHome>/workflows.jsonl`（同 metrics.jsonl 约定，最后一行为准，损坏行跳过 fail-closed）；`agentmesh workflow status <workflowId>` 可跨进程读取。
+- **CLI**：`agentmesh workflow run <spec.json>` 跑到终态（退出码 0/1/2 = done/failed/escalated），`--json` 时进度走 stderr、终态快照走 stdout。
 
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容按 **T2.4 分段限额**控制：共享轮次内的任务描述回显每轮 ≤4000 字符、上游结论总量 ≤12000 字符（多来源均分）、环境快照 ≤2k 字符（超限截断并附 "run git status for full detail" 补救指令），三段独立计费互不挤占（总预算 24k，剩余 ~6k 为下游留白），所有截断都显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 

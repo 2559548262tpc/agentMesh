@@ -414,7 +414,16 @@ export function validateConfigFile(
     return finalize(configPath, parsed.issues.map(schemaIssueToConfigIssue));
   }
 
-  return finalize(configPath, collectConfigSemanticIssues(parsed.config, resolveAgentName));
+  const safetyWarnings: ConfigIssue[] = parsed.warnings.map((warning) => ({
+    severity: "warning",
+    field: warning.field,
+    message: warning.message,
+    fix: 'Acknowledge deliberately with "allowPromptOnly": true in the config root, or move the role to an adapter with a real runtime sandbox (codex: native-sandbox, claude: tool-filtering).',
+  }));
+  return finalize(
+    configPath,
+    safetyWarnings.concat(collectConfigSemanticIssues(parsed.config, resolveAgentName)),
+  );
 }
 
 export function renderConfigValidationReport(report: ConfigValidationReport): void {
