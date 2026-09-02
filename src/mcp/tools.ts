@@ -7,6 +7,9 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
+import type { BridgeSession } from "../core/types.js";
+import { resolveSessionStoragePath } from "../core/session.js";
+import { analyzeHandoff, formatHandoffSummary } from "../core/handoff.js";
 import {
   BackgroundTaskNotFoundError,
   BackgroundTaskRegistry,
@@ -263,15 +266,9 @@ export class BackgroundDispatchService {
     const promise = (async () => {
       try {
         const result = await params.run(controller.signal);
-        await this.registry.writeStoredResult({
-          taskId: params.taskId,
-          status: result.status === "success" ? "completed" : "failed",
-          summary: result.summary,
-          finalAnswer: result.finalAnswer,
-          error: result.error,
-          exitCode: result.exitCode,
-          completedAtMs: Date.now(),
-        });
+        // Checkpoint first: "result visible ⇒ checkpoint visible" becomes a
+        // structural invariant (readers poll for the result and then read the
+        // checkpoint; publishing the result last removes the poll window).
         if (result.status !== "success") {
           await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
             bridgeSessionId: result.sessionId,
@@ -281,17 +278,26 @@ export class BackgroundDispatchService {
             exitCode: result.exitCode,
           });
         }
+        await this.registry.writeStoredResult({
+          taskId: params.taskId,
+          status: result.status === "success" ? "completed" : "failed",
+          summary: result.summary,
+          finalAnswer: result.finalAnswer,
+          error: result.error,
+          exitCode: result.exitCode,
+          completedAtMs: Date.now(),
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
+          reason: controller.signal.aborted ? "cancelled" : "failed",
+          summary: message,
+        });
         await this.registry.writeStoredResult({
           taskId: params.taskId,
           status: "failed",
           error: message,
           completedAtMs: Date.now(),
-        });
-        await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
-          reason: controller.signal.aborted ? "cancelled" : "failed",
-          summary: message,
         });
       } finally {
         forgetActivityHandle(params.taskId);
@@ -710,6 +716,15 @@ export const GetSessionInputSchema = z.object({
   sessionId: NonBlankString.describe("The Bridge session ID to inspect"),
 });
 
+export const HandoffDiffInputSchema = z.object({
+  upstreamSessionId: NonBlankString.describe(
+    "Bridge session whose produced output (task, summary, finalAnswer, findings, repository evidence) is the reference side of the comparison",
+  ),
+  downstreamSessionId: NonBlankString.describe(
+    "Bridge session that consumed the handoff via contextSessionIds; its recorded context injections are compared against the upstream output",
+  ),
+});
+
 export const RollbackTaskInputSchema = z.object({
   sessionId: NonBlankString.describe(
     "Bridge session whose pre-dispatch rollback anchor should be restored",
@@ -871,6 +886,29 @@ function formatRoutingMetadata(metadata: AgentMetadata | undefined): string[] {
   ];
   lines.push(`Notes: ${metadata.notes ?? "unmetered"}`);
   return lines;
+}
+
+/**
+ * M7 handoff_diff: loads the verbatim injected shared-context blocks recorded
+ * as sidecar audit artifacts (contexts/<sessionId>/<turn>.txt next to the
+ * sessions storage) so section judgments can run against the exact bytes the
+ * downstream session received. Best-effort by design: an unreadable or missing
+ * artifact simply degrades that turn's judgment to the recorded audit
+ * metadata (basis: metadata) instead of failing the report.
+ */
+function loadInjectedContextByTurn(downstream: BridgeSession): Map<number, string> {
+  const injected = new Map<number, string>();
+  const storageDir = path.dirname(resolveSessionStoragePath());
+  downstream.history.forEach((entry, index) => {
+    const file = entry.sharedContextAudit?.file;
+    if (!file) return;
+    try {
+      injected.set(index + 1, readFileSync(path.join(storageDir, file), "utf-8"));
+    } catch {
+      // Content basis is best-effort; metadata basis remains available.
+    }
+  });
+  return injected;
 }
 
 export function registerMcpTools(
@@ -1654,6 +1692,58 @@ export function registerMcpTools(
           isError: true,
         };
       }
+    },
+  );
+
+  // handoff_diff — M7 handoff-fidelity judge (ROADMAP_v0.4)
+  server.tool(
+    "handoff_diff",
+    [
+      "Machine judge for handoff fidelity: compares what an upstream Bridge session actually produced (task, summary, finalAnswer, findings, repository evidence) against what a downstream dispatch actually received through contextSessionIds injection, and returns a loss grade — replacing manual history diffing (real_test.md style).",
+      "Grades: lossless | minor-truncation | partial-loss | severe-loss | lost. Section judgments use the verbatim recorded injection content (shared-context audit sidecar) when readable (basis: content) and fall back to the recorded audit metadata (basis: metadata). STALE freshness on the analyzed injection downgrades an otherwise lossless result. The latest context entry referencing the upstream is analyzed; every recorded context entry is listed.",
+    ].join("\n"),
+    HandoffDiffInputSchema.shape,
+    async (args: z.infer<typeof HandoffDiffInputSchema>) => {
+      const upstream = runner.getSession(args.upstreamSessionId);
+      if (!upstream) {
+        return {
+          content: [
+            { type: "text", text: `Upstream session '${args.upstreamSessionId}' not found.` },
+          ],
+          isError: true,
+        };
+      }
+      if (upstream.history.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Upstream session '${args.upstreamSessionId}' has no recorded turns to compare.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+      const downstream = runner.getSession(args.downstreamSessionId);
+      if (!downstream) {
+        return {
+          content: [
+            { type: "text", text: `Downstream session '${args.downstreamSessionId}' not found.` },
+          ],
+          isError: true,
+        };
+      }
+      const report = analyzeHandoff({
+        upstreamHistory: upstream.history,
+        downstreamHistory: downstream.history,
+        upstreamSessionId: args.upstreamSessionId,
+        injectedContextByTurn: loadInjectedContextByTurn(downstream),
+      });
+      const text = `${formatHandoffSummary(report)}\n\n${JSON.stringify(report, null, 2)}`;
+      return {
+        content: [{ type: "text", text }],
+        isError: report.grade === "lost" || report.grade === "severe-loss",
+      };
     },
   );
 }

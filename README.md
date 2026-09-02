@@ -295,6 +295,9 @@ agentmesh capabilities show
 11. **`get_workflow`**
     - 返回工作流当前快照：总体状态、逐 stage 状态迁移、派发任务记录（stage 任务 ID 形如 `<workflowId>_s<stage>_<seq>`，可被 `poll_task`/`cancel_task` 直接观察）、验收命令结果、逐轮评审 verdict 与 findings、终态完整证据链。
     - 参数：`workflowId` (必填), `maxWaitMs` (可选，0-60000 事件驱动长轮询，推荐 30000)。本进程持有的活跃工作流支持长轮询；其他（含已结束 bridge 进程启动的）工作流从持久化的 workflows.jsonl 日志读取最后一份快照（追加式 JSONL，损坏行跳过 fail-closed）。
+12. **`handoff_diff`**
+    - 交接保真度的机器判定（v0.4 M7）：传入 `upstreamSessionId` 与 `downstreamSessionId`（均为 Bridge session id），对比上游会话实际产出（task、summary、finalAnswer、findings、仓库证据）与下游派发实际接收到的注入内容，返回损失等级——`lossless | minor-truncation | partial-loss | severe-loss | lost`——附逐节判定（`missingKeys`/`truncatedKeys`/`preservedSections`）与下游会话每次上下文注入的完整清单。
+    - 判定优先使用逐字记录的注入内容（shared-context audit sidecar），不可读时降级为审计元数据；被分析注入的 STALE 新鲜度会把无损结果降级。用它替代人工比对会话历史来判断交接是否损失信息。
 
 ### 配置到 MCP 客户端
 

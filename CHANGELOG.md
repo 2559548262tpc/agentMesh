@@ -4,17 +4,38 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
-### Planned (v0.4)
+### v0.4 改造方案（ROADMAP_v0.4.md，M0-M7）
 
-- v0.4 改造方案已定稿于 [ROADMAP_v0.4.md](ROADMAP_v0.4.md)（外视角重构版），里程碑：
-  - M0 度量先行（任务级 metrics + reviewer 确认率 + 交接指纹）
-  - M1 fake-vendor 仿真 harness（人工压测故障类别全部进 CI）
-  - M2 模型健康度自动路由与自动止损（数据驱动，熔断 + 探针恢复）
-  - M3 评审价值度量与 findings 毕业（quick review 机器化，重复缺陷下沉为静态检查）
-  - M4 确定性编排状态机（声明式 WorkflowSpec + `run_workflow`/`get_workflow`，组长只在写 spec 与 ESCALATED 时介入）
-  - M5 安全默认翻转（默认 enforced 沙箱，prompt-only 需显式信任声明，预期 BREAKING）
-  - M6 统一数据层（SQLite 单一数据源，替代 JSONL 多源手工同步，可选）
-  - M7 生命周期原语与交接保真（优先级/依赖 DAG/暂停恢复 + `handoff_diff` 交接损失机器判定）
+#### Added
+
+- **M0 task metrics:** append-only `metrics.jsonl` in the agentmesh home records per-dispatch role/agent/model/tokens/duration/outcome; the background watchdog records stall events attributed by `taskId`. `agentmesh stats` aggregates per model/role over `all|24h|7d` windows (p50/p95 duration, retry/stall/cancel rates, `--json`).
+- **M1 simulation harness:** dependency-free `scripts/fake-vendors/fake-vendor.mjs` (ok/stall/truncate/apierror/slow/semantic-fail/exit-mismatch) plus 9 process-level scenarios under `npm run test:simulation` pinning the r21/r22 fault classes (0-byte stall, vendor APIError, truncation, exit/semantic mismatch, cancellation, slow vendor) as CI regressions via the real MCP surface and adapter.
+- **M2 model health routing:** `health.jsonl` rolling windows with a 24h half-life failure score, p50/p95 durations, and a consecutive-failure circuit breaker (quarantine after 3, 30min cooldown lift). `hint.nextCandidates` reorder: tier match → health score → costLevel; quarantined models excluded with a last-resort warning. `agentmesh health` CLI with `--json` and `--reset`.
+- **M3 review findings metrics:** `findings.jsonl` store with category/kind taxonomy and confirmed-tracking when the rework loop closes (repo-evidence change = confirmed, no-op-rework PASS = rejected); precision aggregation and graduation proposals (eslint-rule vs acceptance-script). New `verify_contract_map` MCP tool: machine-checked quick review over contract item → file:line mappings, zero LLM tokens.
+- **M4 deterministic workflow engine:** declarative JSON WorkflowSpec executed by an in-process state machine (`run_workflow`/`get_workflow`, `agentmesh workflow run/status`): stages with role dispatch templates, acceptance commands/file checks, parallelGroups, rework loop with findings re-injection, and fail-closed escalation carrying a full evidence chain. Waiting is event-driven; dispatches inherit the background-task registry, stalled watchdog, and cancel semantics.
+- **cancel_task primitive:** cancels a running background task through the watchdog abort path with checkpoint spill; idempotent on terminal tasks, structured `NOT_FOUND`/`NOT_CANCELLABLE` errors.
+- **M7 handoff_diff:** machine judge for handoff fidelity — compares upstream normalized history against what the downstream dispatch actually received (verbatim shared-context audit sidecar when readable, audit metadata as fallback) and returns `lossless | minor-truncation | partial-loss | severe-loss | lost` with per-section judgments.
+
+#### Changed
+
+- **BREAKING (M5):** unset role `sandboxLevel` now resolves to the strongest sandbox the target adapter declares (codex native-sandbox, claude tool-filtering) instead of implicit prompt-only. `prompt-only` still works but requires explicit choice or the root-level `allowPromptOnly` acknowledgment flag, otherwise config validation carries an actionable warning. Resolution order: explicit role config > agents metadata > adapter capability default > prompt-only fallback with warning.
+- **M6 unified data layer:** a single `StorageService` owns home-directory resolution (including `AGENTMESH_SESSIONS_FILE` relocation), atomic writes (temp+fsync+rename with an fsync opt-out for best-effort evidence), corrupt-line tolerance, and change events; sessions/tasks/metrics/findings/health/workflows/checkpoints/capabilities and the UI's data reads all route through it. Persisted formats and locations are byte-compatible — no migration.
+- `agentmesh config validate` and `doctor` surface the new sandbox safety warnings; the checkpoint spill is published before the terminal result so "result visible ⇒ checkpoint visible" holds structurally.
+
+## Planned (v0.4 roadmap, pending)
+
+- M7 remaining lifecycle primitives: task priorities, dependency DAG scheduling, pause/resume (deferred to a follow-up pass on top of M6).
+
+### v0.4 改造方案已定稿于 [ROADMAP_v0.4.md](ROADMAP_v0.4.md)（外视角重构版），里程碑摘要：
+
+- M0 度量先行（任务级 metrics + reviewer 确认率 + 交接指纹）
+- M1 fake-vendor 仿真 harness（人工压测故障类别全部进 CI）
+- M2 模型健康度自动路由与自动止损（数据驱动，熔断 + 探针恢复）
+- M3 评审价值度量与 findings 毕业（quick review 机器化，重复缺陷下沉为静态检查）
+- M4 确定性编排状态机（声明式 WorkflowSpec + `run_workflow`/`get_workflow`，组长只在写 spec 与 ESCALATED 时介入）
+- M5 安全默认翻转（默认最强可用沙箱，prompt-only 需显式信任声明，BREAKING）
+- M6 统一数据层（单一 StorageService 所有者，零迁移）
+- M7 生命周期原语与交接保真（`handoff_diff` 已落地；优先级/依赖 DAG/暂停恢复待后续）
 
 ## 0.3.0 - 2026-09-02
 

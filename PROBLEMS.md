@@ -734,3 +734,13 @@
 **解决方法**：① `.agentmesh/` 前缀默认排除（桥接自身元数据）；② `review_changes` 与 `delegate_task`(role=reviewer) 新增 `reviewPaths` 参数（仓库相对路径，≤50 个）：设置后守卫只对受审路径集内的变更判 FAIL，范围外变更降级为 `reviewerSafety.warning` 披露；未设置时保持全树守卫语义（fail-closed 不变）。README 已同步。
 
 **状态**：已修复（2026-09-02，runner.test.ts 新增 2 个回归用例：范围外变更忽略 + `.agentmesh/` 默认排除；并修正既有用例对主仓库工作区脏状态的敏感性）。
+
+## P-074 满载下 vitest 全量套件随机超时（受害者不固定，基线即存在）
+
+**问题**：46 个测试文件并行运行时，任一耗时接近 20s 的测试可能随机超时失败：v0.4 迭代期间先后出现 `tests/mcp/background.test.ts`（long-poll 用例，两次）与 `tests/core/repository.test.ts`（untracked fingerprints 用例，24.7s），重跑单文件均绿；基线（d8cb91f，未含 v0.4 改动）也出现过同文件 waitFor 超时，排除波次回归。
+
+**根因**：满载饥饿而非代码缺陷——p5-unattended（53s）、rollback（35s）、repository（23s）等重文件与 46 个文件并行抢 CPU/磁盘，慢受害者可在 20s vitest 默认 testTimeout 内完不成自身逻辑；`background.test.ts` 长轮询用例另有自身缺陷：`maxWaitMs: 30_000` 大于测试超时 20s，事件唤醒被饿死一次后该用例必死（预算倒挂）。M6 的全局 fsync 原子写会加剧 I/O 延迟但不改变结论。
+
+**解决方法**：① 长轮询用例 `maxWaitMs` 降至 15_000（仍远大于 300ms gate 延迟，"单次调用阻塞直至终态"的断言不变），消除预算倒挂；② 环境性饥饿不加全局超时掩盖——复现时以"重跑单文件/受影响套件"判定，连续同一用例失败才视为回归。
+
+**状态**：已修复预算倒挂（2026-09-02）；环境饥饿为已知非缺陷，满载下偶发超时重跑即可，连续失败才立案。

@@ -239,9 +239,13 @@ describe("mcp background delegate and poll_task", () => {
     setTimeout(() => gate.open(), 300);
 
     const startedAt = Date.now();
+    // maxWaitMs must stay under the vitest 20s test budget: on a starved
+    // machine one missed event wake recovers via the poller's own re-check at
+    // the next pollOnce, and the call then returns by this deadline instead of
+    // losing a race against the suite-level timeout.
     const res = await client.callTool({
       name: "poll_task",
-      arguments: { taskId, maxWaitMs: 30_000 },
+      arguments: { taskId, maxWaitMs: 15_000 },
     });
     const outcome = JSON.parse((res.content as Array<{ type: string; text: string }>)[0]!.text) as {
       status: string;
