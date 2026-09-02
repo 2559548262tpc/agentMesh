@@ -142,6 +142,8 @@ export function buildReviewerPrompt(
     `  file: path/to/file`,
     `  line: line number or range`,
     `  issue: Detailed explanation of what is wrong`,
+    `  category: <short lowercase tag> (e.g. security | correctness | testing | error-handling | style | type-safety | performance | documentation)`,
+    `  kind: [defect | style | risk | security | semantic] (only when confident; omit otherwise)`,
     `  suggestion: How to fix the issue`,
   );
   return sections.join("\n");

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +11,7 @@ import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
 import { BaseAdapter } from "../../src/agents/base.js";
+import { readFindings } from "../../src/core/findings.js";
 import type {
   AgentName,
   AgentResult,
@@ -73,10 +75,35 @@ class TestAdapter extends BaseAdapter {
           reviewVerdictRequired: verdictRequired,
         });
       }
+      if (options.task.includes("FAIL_NOOP_TRIGGER")) {
+        const failOutput = `FAIL\n- severity: medium\n  file: src/config.ts\n  line: 7\n  issue: Unused variable\n  suggestion: Remove it`;
+        return this.formatSuccessResult(failOutput, Date.now(), {
+          nativeSessionId: "native_rev_fail_noop",
+          exitCode: 0,
+          role: "reviewer",
+          reviewVerdictRequired: verdictRequired,
+        });
+      }
       return this.formatSuccessResult("PASS\nAll checks passed cleanly.", Date.now(), {
         nativeSessionId: "native_rev_123",
         exitCode: 0,
         role: "reviewer",
+        reviewVerdictRequired: verdictRequired,
+      });
+    }
+
+    // M3 rework-closure fixture: a worker fix turn that (only for the SQL
+    // Injection finding scenario) repairs the repository by writing a file so
+    // the rework loop's repository fingerprints differ across the fix turn.
+    if (options.task.includes("REWORK ROUND")) {
+      if (options.task.includes("SQL Injection") && options.cwd) {
+        fs.writeFileSync(path.join(options.cwd, "rework-fix-applied.txt"), "fix applied", "utf-8");
+      }
+      return this.formatSuccessResult("Rework fix applied", Date.now(), {
+        nativeSessionId: options.nativeSessionId || "native_rework_fix",
+        exitCode: 0,
+        summary: "Rework fix applied",
+        role: options.role,
         reviewVerdictRequired: verdictRequired,
       });
     }
@@ -98,8 +125,17 @@ describe("mcp/tools protocol integration", () => {
   let serverTransport: InMemoryTransport;
   let runner: MultiAgentRunner;
   let adapter: TestAdapter;
+  // M3 findings-store isolation: review_changes persists findings.jsonl under
+  // the AgentMesh home, so every test in this file relocates the home into a
+  // temp directory (same relocation seam as AGENTMESH_SESSIONS_FILE).
+  let findingsHomeDir: string;
 
   beforeEach(async () => {
+    findingsHomeDir = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-tools-home-")),
+    );
+    process.env.AGENTMESH_SESSIONS_FILE = path.join(findingsHomeDir, "sessions.json");
+
     const registry = new AgentRegistry();
     const sessionManager = new SessionManager({ persist: false });
     adapter = new TestAdapter();
@@ -115,6 +151,8 @@ describe("mcp/tools protocol integration", () => {
   });
 
   afterEach(async () => {
+    delete process.env.AGENTMESH_SESSIONS_FILE;
+    fs.rmSync(findingsHomeDir, { recursive: true, force: true });
     try {
       await clientTransport.close();
       await serverTransport.close();
@@ -473,6 +511,208 @@ describe("mcp/tools protocol integration", () => {
       expect(text).toContain("Tier: medium | Cost level: 3");
     } finally {
       fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("exposes the verify_contract_map quick-review tool (M3)", async () => {
+    const response = await client.listTools();
+    const tool = response.tools.find((candidate) => candidate.name === "verify_contract_map");
+    expect(tool).toBeDefined();
+    expect(tool!.description).toContain("contract map");
+    expect(tool!.description).toContain("without spending LLM tokens");
+  });
+
+  it("attaches the M3 enriched shape to review findings and records them in the findings store", async () => {
+    const res = await client.callTool({
+      name: "review_changes",
+      arguments: {
+        agent: "codex",
+        task: "Review PR #42 FAIL_TRIGGER",
+        baseCommit: "main",
+      },
+    });
+
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    const text = content[0]?.text ?? "";
+    const findingsStart = text.indexOf("Findings:\n");
+    expect(findingsStart).toBeGreaterThan(-1);
+    const findingsEnd = text.indexOf("\nReviewer Safety:", findingsStart);
+    const findings = JSON.parse(
+      text.slice(findingsStart + "Findings:\n".length, findingsEnd),
+    ) as Array<Record<string, unknown>>;
+    expect(findings).toHaveLength(1);
+    // Existing parsed fields are unchanged; id/category/kind are additive.
+    expect(findings[0]).toMatchObject({
+      severity: "high",
+      file: "src/auth.ts",
+      line: "42",
+      issue: "SQL Injection",
+      suggestion: "Use parameterized query",
+      category: "security",
+      kind: "security",
+    });
+    expect(String(findings[0]!.id)).toMatch(/^fnd_[0-9a-f]{16}$/);
+
+    const records = readFindings({ homeDir: findingsHomeDir });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      findingId: findings[0]!.id,
+      reviewerAgent: "codex",
+      category: "security",
+      kind: "security",
+      severity: "high",
+      file: "src/auth.ts",
+    });
+    // No rework closure signal exists for a single-pass FAIL review.
+    expect(records[0]!.confirmed).toBeUndefined();
+  });
+
+  it("marks rework-triggering findings confirmed when the rework closes PASS", async () => {
+    const projectDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-rework-")));
+    try {
+      execSync("git init", { cwd: projectDir, stdio: "ignore" });
+      const seed = await runner.delegateTask({
+        agent: "codex",
+        task: "Seed worker for rework",
+        cwd: projectDir,
+      });
+
+      const res = await client.callTool({
+        name: "review_changes",
+        arguments: {
+          agent: "codex",
+          task: "Review PR #42 FAIL_TRIGGER",
+          cwd: projectDir,
+          maxReworkRounds: 1,
+          workerSessionId: seed.sessionId!,
+        },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const content = res.content as Array<{ type: string; text: string }>;
+      expect(content[0]?.text).toContain("Review Outcome: PASS");
+      expect(content[0]?.text).toContain("Rework Rounds: 1");
+      // The fake worker fix turn wrote into the repo, so the fingerprints differ.
+      expect(fs.existsSync(path.join(projectDir, "rework-fix-applied.txt"))).toBe(true);
+
+      const records = readFindings({ homeDir: findingsHomeDir });
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        reviewerAgent: "codex",
+        category: "security",
+        kind: "security",
+        severity: "high",
+        file: "src/auth.ts",
+        confirmed: true,
+        sessionId: seed.sessionId!,
+      });
+      expect(records[0]!.evidence).toContain("changed the repository");
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks rework findings as false positives when the fix turn changes nothing", async () => {
+    const projectDir = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-rework-noop-")),
+    );
+    try {
+      execSync("git init", { cwd: projectDir, stdio: "ignore" });
+      const seed = await runner.delegateTask({
+        agent: "codex",
+        task: "Seed worker for noop rework",
+        cwd: projectDir,
+      });
+
+      const res = await client.callTool({
+        name: "review_changes",
+        arguments: {
+          agent: "codex",
+          task: "Review PR #7 FAIL_NOOP_TRIGGER",
+          cwd: projectDir,
+          maxReworkRounds: 1,
+          workerSessionId: seed.sessionId!,
+        },
+      });
+
+      expect(res.isError).toBeFalsy();
+
+      const records = readFindings({ homeDir: findingsHomeDir });
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        file: "src/config.ts",
+        severity: "medium",
+        confirmed: false,
+      });
+      expect(records[0]!.evidence).toContain("false positive");
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies a broken contract map over MCP with per-item failure statuses", async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-contractmap-"));
+    try {
+      fs.writeFileSync(
+        path.join(projectDir, "src.ts"),
+        "export const a = 1;\n\nexport const b = 2;\n",
+        "utf-8",
+      );
+      const res = await client.callTool({
+        name: "verify_contract_map",
+        arguments: {
+          contractItems: [
+            { id: "C1", text: "exports a" },
+            { id: "C2", text: "exports b on a non-blank line" },
+            { id: "C3", text: "covers the tests" },
+          ],
+          map: [
+            { id: "C1", file: "src.ts", line: 1 },
+            { id: "C2", file: "src.ts", line: 2 }, // blank line
+            { id: "C4", file: "src.ts", line: 3 }, // not a contract item
+            { id: "C3", file: "absent.ts", line: 1 }, // unreadable file
+          ],
+          cwd: projectDir,
+        },
+      });
+
+      expect(res.isError).toBe(true);
+      const content = res.content as Array<{ type: string; text: string }>;
+      const report = JSON.parse(content[0]!.text) as {
+        pass: boolean;
+        items: Array<{ id: string; status: string; detail?: string }>;
+      };
+      expect(report.pass).toBe(false);
+      const byId = new Map(report.items.map((item) => [item.id, item]));
+      expect(byId.get("C1")).toMatchObject({ status: "ok", detail: "src.ts:1" });
+      expect(byId.get("C2")).toMatchObject({ status: "empty" });
+      expect(byId.get("C3")).toMatchObject({ status: "missing" });
+      expect(byId.get("C3")?.detail).toContain("File not readable");
+      expect(byId.get("C4")).toMatchObject({ status: "unknown-item" });
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes a complete contract map over MCP without an error flag", async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-contractmap-ok-"));
+    try {
+      fs.writeFileSync(path.join(projectDir, "src.ts"), "export const a = 1;\n", "utf-8");
+      const res = await client.callTool({
+        name: "verify_contract_map",
+        arguments: {
+          contractItems: [{ id: "C1", text: "exports a" }],
+          map: [{ id: "C1", file: "src.ts", line: 1 }],
+          cwd: projectDir,
+        },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const content = res.content as Array<{ type: string; text: string }>;
+      expect(JSON.parse(content[0]!.text)).toMatchObject({ pass: true });
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
     }
   });
 });

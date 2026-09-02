@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import * as path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -17,6 +18,13 @@ import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/arti
 import { defaultCheckpointStore } from "../core/checkpoint.js";
 import type { AgentMetadata } from "../core/config.js";
 import { truncateText } from "../core/text.js";
+import {
+  appendFindings,
+  collectReworkClosureFindings,
+  enrichReviewFinding,
+} from "../core/findings.js";
+import type { FindingRecord } from "../core/findings.js";
+import { verifyContractMap } from "../core/contractMap.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
@@ -616,6 +624,70 @@ async function formatResultForMcp(
   });
 }
 
+/**
+ * M3 findings-value tracking seam. Enriches the review result's findings with
+ * the machine-readable taxonomy (deterministic id, category, kind — additive
+ * to the parsed shape) and appends them to the findings store. When the
+ * bounded rework loop closed in PASS, the findings that triggered the rework
+ * are recovered from the worker session's injected fix prompts and recorded
+ * with their confirmation signal: confirmed true when the fix turn changed the
+ * repository (real defects that were fixed), confirmed false when the fix turn
+ * changed nothing yet the re-review passed (false positives), and left
+ * undefined when no reliable change signal exists. Best-effort: enrichment or
+ * store failures never alter the review verdict.
+ */
+function recordReviewFindings(
+  runner: MultiAgentRunner,
+  result: AgentResult,
+  options: { taskId?: string } = {},
+): void {
+  const enriched = (result.findings ?? []).map((finding) => enrichReviewFinding(finding));
+  if (enriched.length > 0) result.findings = enriched;
+  const reviewedAt = new Date().toISOString();
+  const records: FindingRecord[] = enriched.map((finding) => ({
+    findingId: finding.id,
+    sessionId: result.sessionId ?? "unknown",
+    ...(options.taskId !== undefined ? { taskId: options.taskId } : {}),
+    reviewerAgent: result.agent,
+    category: finding.category,
+    kind: finding.kind,
+    severity: finding.severity,
+    file: finding.file,
+    ...(finding.line !== undefined ? { line: finding.line } : {}),
+    reviewedAt,
+  }));
+  const rework = result.rework;
+  if (rework && rework.rounds > 0 && result.reviewOutcome === "PASS" && rework.workerSessionId) {
+    const session = runner.getSession(rework.workerSessionId);
+    for (const closure of collectReworkClosureFindings(session?.history ?? [], rework.rounds)) {
+      const finding = enrichReviewFinding(closure.finding);
+      const evidence =
+        closure.changedRepository === undefined
+          ? `Rework round ${closure.round} closed PASS; no reliable code-change signal for this finding.`
+          : closure.changedRepository
+            ? `Rework round ${closure.round} fix changed the repository and the re-review returned PASS.`
+            : `Rework round ${closure.round} fix changed nothing and the re-review returned PASS; treated as a false positive.`;
+      records.push({
+        findingId: finding.id,
+        sessionId: rework.workerSessionId,
+        ...(options.taskId !== undefined ? { taskId: options.taskId } : {}),
+        reviewerAgent: result.agent,
+        category: finding.category,
+        kind: finding.kind,
+        severity: closure.finding.severity,
+        file: closure.finding.file,
+        ...(closure.finding.line !== undefined ? { line: closure.finding.line } : {}),
+        reviewedAt: closure.reviewedAt ?? reviewedAt,
+        ...(closure.changedRepository !== undefined
+          ? { confirmed: closure.changedRepository }
+          : {}),
+        evidence,
+      });
+    }
+  }
+  appendFindings(records);
+}
+
 export const ListAgentsInputSchema = z.object({
   cwd: NonBlankString.optional().describe(
     "Project directory used to locate the nearest .agentmesh/config.json agents metadata (defaults to current directory)",
@@ -630,6 +702,35 @@ export const CompactContextInputSchema = z.object({
     .describe(
       "Up to 4 Bridge sessions whose normalized history should be condensed into a semantic summary sidecar",
     ),
+});
+
+export const VerifyContractMapInputSchema = z.object({
+  contractItems: z
+    .array(
+      z.object({
+        id: NonBlankString.describe("Contract item identifier from the task's contract checklist"),
+        text: NonBlankString.describe(
+          "What the contract item requires (verbatim from the contract)",
+        ),
+      }),
+    )
+    .min(1)
+    .describe("Contract checklist items the worker had to satisfy"),
+  map: z
+    .array(
+      z.object({
+        id: NonBlankString.describe("Contract item id this entry maps to"),
+        file: NonBlankString.describe(
+          "Repo-relative (or absolute) path of the file satisfying the item",
+        ),
+        line: z.number().int().min(1).describe("1-based line number inside the file"),
+      }),
+    )
+    .min(1)
+    .describe("Worker-delivered contract item -> file:line map to verify"),
+  cwd: NonBlankString.optional().describe(
+    "Working directory used to resolve relative file paths (defaults to current directory)",
+  ),
 });
 
 /** Formats one routing-metadata field group, degrading to "unmetered" (T4.2). */
@@ -915,8 +1016,8 @@ export function registerMcpTools(
           background.launch({
             taskId,
             outputFile,
-            run: (signal) =>
-              runner.reviewChanges({
+            run: async (signal) => {
+              const result = await runner.reviewChanges({
                 agent: args.agent,
                 task: args.task,
                 cwd: args.cwd,
@@ -931,7 +1032,10 @@ export function registerMcpTools(
                 maxReworkRounds: args.maxReworkRounds,
                 workerSessionId: args.workerSessionId,
                 signal,
-              }),
+              });
+              recordReviewFindings(runner, result, { taskId });
+              return result;
+            },
           });
           return {
             content: [
@@ -967,6 +1071,7 @@ export function registerMcpTools(
             signal: extra.signal,
           }),
         );
+        recordReviewFindings(runner, result);
 
         const isError = result.status === "failed" || result.reviewOutcome === "FAIL";
 
@@ -1202,6 +1307,39 @@ export function registerMcpTools(
             {
               type: "text",
               text: `Bridge Error in rollback_task: ${errorMsg instanceof Error ? errorMsg.message : String(errorMsg)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // verify_contract_map — M3 quick-review automation
+  server.tool(
+    "verify_contract_map",
+    [
+      "Machine-verifies a worker-delivered contract map (contract item id -> file:line) without spending LLM tokens: every mapped file must exist and be readable, the referenced line must be within bounds, and the line must be non-empty.",
+      "Use it as the quick-review gate over a task's contract checklist before any deep LLM review; a pass:false report lists each item's failure status (missing | out-of-bounds | empty | unknown-item) so the worker can repair the mapping without a reviewer round.",
+    ].join("\n"),
+    VerifyContractMapInputSchema.shape,
+    async (args: z.infer<typeof VerifyContractMapInputSchema>) => {
+      try {
+        const cwd = args.cwd ?? process.cwd();
+        const report = verifyContractMap(args.contractItems, args.map, (filePath) =>
+          readFileSync(path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath), "utf-8"),
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+          isError: !report.pass,
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in verify_contract_map: ${errorMsg}`,
             },
           ],
           isError: true,
