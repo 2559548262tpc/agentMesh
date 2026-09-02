@@ -12,6 +12,7 @@ import {
   BackgroundTaskRegistry,
   readTailSnapshot,
 } from "../core/background.js";
+import type { StoredTaskResult } from "../core/background.js";
 import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
 import { createAgentMeshEventBus } from "../core/events.js";
 import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
@@ -25,6 +26,13 @@ import {
 } from "../core/findings.js";
 import type { FindingRecord } from "../core/findings.js";
 import { verifyContractMap } from "../core/contractMap.js";
+import {
+  WorkflowEngineRegistry,
+  WorkflowSpecSchema,
+  createDefaultCandidateResolver,
+  parseWorkflowSpec,
+  readPersistedWorkflowSnapshot,
+} from "../core/workflow.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
@@ -337,6 +345,76 @@ export class BackgroundDispatchService {
     for (const entry of entries) entry.controller.abort(new Error(reason));
     await Promise.allSettled(entries.map((entry) => entry.promise));
   }
+
+  /**
+   * cancel_task primitive (ROADMAP_v0.4 M7): cancels one running background
+   * dispatch through its existing abort controller — the exact path the
+   * stalled-watchdog termination uses. The launch completion path records the
+   * terminal failed result and spills the output-tail checkpoint (reason
+   * "cancelled"), and the runner terminates the full vendor process tree.
+   * Already-terminal tasks are a no-op that reports the current status;
+   * unknown tasks raise BackgroundTaskNotFoundError. A task registered by a
+   * foreign live bridge (or no longer running without a result) is reported
+   * as NOT_CANCELLABLE instead of being touched cross-process.
+   */
+  public async cancel(taskId: string, reason = "client_cancel"): Promise<CancelTaskOutcome> {
+    const entry = this.pending.get(taskId);
+    if (entry) {
+      entry.controller.abort(new Error(`cancelled by client (${reason})`));
+      await entry.promise;
+      return {
+        taskId,
+        status: "cancelled",
+        alreadyTerminal: false,
+        cancelReason: reason,
+        result: await this.registry.readStoredResult(taskId),
+      };
+    }
+    const stored = await this.registry.readStoredResult(taskId);
+    if (stored) {
+      return {
+        taskId,
+        status: stored.status,
+        alreadyTerminal: true,
+        cancelReason: reason,
+        result: stored,
+      };
+    }
+    const record = this.registry.getRegisteredTask(taskId);
+    if (!record) throw new BackgroundTaskNotFoundError(taskId);
+    const detail =
+      record.pid === process.pid
+        ? "it is owned by this process but is no longer running"
+        : `it is owned by another live bridge process (pid ${record.pid})`;
+    throw new BackgroundTaskNotCancellableError(
+      taskId,
+      `Background task '${taskId}' cannot be cancelled: ${detail}.`,
+    );
+  }
+}
+
+/** Terminal outcome of a cancel_task call. */
+export interface CancelTaskOutcome {
+  taskId: string;
+  /** "cancelled" when this call aborted a running dispatch; otherwise the existing terminal status. */
+  status: "cancelled" | "completed" | "failed";
+  /** True when the task was already terminal and nothing was aborted. */
+  alreadyTerminal: boolean;
+  /** Cancel reason carried into the abort signal (existing cancel taxonomy). */
+  cancelReason: string;
+  /** Terminal task result; absent when the owning process died before recording one. */
+  result?: StoredTaskResult;
+}
+
+/** Raised by cancel() for tasks that exist but cannot be cancelled here. */
+export class BackgroundTaskNotCancellableError extends Error {
+  readonly taskId: string;
+
+  constructor(taskId: string, message: string) {
+    super(message);
+    this.name = "BackgroundTaskNotCancellableError";
+    this.taskId = taskId;
+  }
 }
 
 async function runWithProgress(
@@ -547,6 +625,49 @@ export const ReviewChangesInputSchema = z.object({
     "Bridge session of the worker whose changes are under review; required for the rework loop when " +
       "no worker-role contextSessionId is provided",
   ),
+});
+
+export const CancelTaskInputSchema = z.object({
+  taskId: NonBlankString.describe(
+    "Background task ID previously returned by delegate_task or review_changes (background:true)",
+  ),
+  reason: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "Short cancellation reason carried into the terminal outcome and the checkpoint spill (default 'client_cancel')",
+    ),
+});
+
+export const RunWorkflowInputSchema = z.object({
+  spec: WorkflowSpecSchema.describe(
+    "Workflow specification: named stages with dispatch (agent, taskTemplate with " +
+      "{{workflowName}}/{{stageName}}/{{group}}/{{upstreamSummaries}} substitution, contextPolicy), " +
+      "acceptance (commands + required files), and policy (maxReworkRounds, escalateOn, reRouteOnStall). " +
+      "Each stage declares exactly one of roles or parallelGroups",
+  ),
+  cwd: NonBlankString.optional().describe(
+    "Working directory for stage dispatches and acceptance commands (defaults to current directory)",
+  ),
+});
+
+export const GetWorkflowInputSchema = z.object({
+  workflowId: NonBlankString.describe("Workflow ID previously returned by run_workflow"),
+  maxWaitMs: z
+    .number()
+    .int()
+    .min(0)
+    .max(60_000)
+    .optional()
+    .describe(
+      "Long-poll budget in milliseconds: for workflows owned by this bridge process the call blocks " +
+        "until the state changes or the workflow reaches a terminal status (event-driven), up to this " +
+        "ceiling. Recommended 30000; omit for a quick non-blocking status check. Persisted snapshots " +
+        "(workflow not owned by this process) are returned immediately",
+    ),
 });
 
 export const ContinueTaskInputSchema = z.object({
@@ -958,6 +1079,194 @@ export function registerMcpTools(
             {
               type: "text",
               text: `Bridge Error in poll_task: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // cancel_task — M7 lifecycle primitive
+  server.tool(
+    "cancel_task",
+    "Cancels a running background task through its abort controller: terminates the full vendor process tree (Windows taskkill /T /F), spills the captured output tail as a one-shot checkpoint (resumable via continue_task fromCheckpoint), and records the terminal outcome in the task registry. An already-terminal task is a no-op that reports its current status without side effects.",
+    CancelTaskInputSchema.shape,
+    async (args: z.infer<typeof CancelTaskInputSchema>) => {
+      try {
+        const outcome = await background.cancel(args.taskId, args.reason);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(outcome, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        if (err instanceof BackgroundTaskNotFoundError) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: "NOT_FOUND", taskId: err.taskId, message: err.message },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (err instanceof BackgroundTaskNotCancellableError) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: "NOT_CANCELLABLE", taskId: err.taskId, message: err.message },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in cancel_task: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // run_workflow — M4 deterministic orchestration state machine
+  const workflowEngines = new WorkflowEngineRegistry();
+  server.tool(
+    "run_workflow",
+    [
+      "Runs a declarative workflow spec through the in-process deterministic state machine (no LLM orchestrator in the loop): each stage dispatches agents (worker/reviewer/tester roles or parallelGroups packages), runs its acceptance commands + file checks, and for reviewer stages loops bounded rework (findings re-injected into the worker session via continue_task) until PASS or rounds are exhausted.",
+      "Stage dispatches run as background tasks through the same registry/watchdog/cancel_task path as delegate_task(background:true); waiting is event-driven. Dispatch failures re-route along the health-ordered candidate chain when the stage policy declares reRouteOnStall.",
+      "Terminal statuses: done (every stage passed), escalated (the configured escalateOn failure class hit — the snapshot carries the full evidence chain: per-round findings, acceptance command outputs, repository diff summary), failed (any other stage failure). ESCALATED is the only point where the LLM orchestrator or the human takes over.",
+      "Always asynchronous: returns immediately with workflowId; observe with get_workflow (maxWaitMs=30000 for event-driven long-polling).",
+    ].join("\n"),
+    RunWorkflowInputSchema.shape,
+    async (args: z.infer<typeof RunWorkflowInputSchema>) => {
+      try {
+        const parsed = parseWorkflowSpec(args.spec);
+        if (!parsed.success || !parsed.spec) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ error: "INVALID_SPEC", issues: parsed.issues }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const cwd = args.cwd ?? process.cwd();
+        const engine = workflowEngines.create(parsed.spec, {
+          dispatch: runner,
+          background,
+          cwd,
+          candidateResolver: createDefaultCandidateResolver(runner, cwd),
+        });
+        void engine.run();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  workflowId: engine.id,
+                  name: parsed.spec.name,
+                  status: "running",
+                  stages: parsed.spec.stages.map((stage) => stage.name),
+                  guidance:
+                    "The workflow executes asynchronously; call get_workflow with maxWaitMs=30000 (event-driven long-poll) until the status is terminal. Each stage dispatch is visible to poll_task/cancel_task under the task IDs <workflowId>_s<stage>_<seq>.",
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in run_workflow: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // get_workflow — observe a workflow run (live engine or persisted snapshot)
+  server.tool(
+    "get_workflow",
+    "Returns the current workflow snapshot: overall status (running/done/escalated/failed), per-stage status transitions, dispatched task records, acceptance command results, review verdicts with per-round findings, and the full evidence chain for terminal failures. Live workflows owned by this bridge process support event-driven long-polling via maxWaitMs; workflows from earlier bridge processes are served from the persisted workflow log.",
+    GetWorkflowInputSchema.shape,
+    async (args: z.infer<typeof GetWorkflowInputSchema>) => {
+      try {
+        const engine = workflowEngines.get(args.workflowId);
+        if (engine) {
+          const snapshot = await engine.waitForUpdate(args.maxWaitMs ?? 0);
+          return {
+            content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
+            isError: snapshot.status === "failed" || snapshot.status === "escalated",
+          };
+        }
+        const persisted = readPersistedWorkflowSnapshot(args.workflowId);
+        if (persisted) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  persisted.status === "running"
+                    ? {
+                        ...persisted,
+                        note: "Persisted snapshot: this workflow was started by another bridge process, so no live long-polling is available. If that process died, its stage tasks are dead-lettered and the workflow will never advance.",
+                      }
+                    : persisted,
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: persisted.status === "failed" || persisted.status === "escalated",
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "NOT_FOUND", workflowId: args.workflowId }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in get_workflow: ${errorMsg}`,
             },
           ],
           isError: true,

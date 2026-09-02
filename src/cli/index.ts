@@ -1,7 +1,9 @@
 import { Command, InvalidArgumentError } from "commander";
+import * as fs from "node:fs";
 import { defaultRunner } from "../core/runner.js";
 import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
+import { BackgroundDispatchService } from "../mcp/tools.js";
 import { startUiServer } from "../ui/server.js";
 import { VERSION } from "../version.js";
 import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
@@ -10,6 +12,13 @@ import { aggregateTaskMetrics, readTaskMetrics } from "../core/metrics.js";
 import type { MetricsWindow } from "../core/metrics.js";
 import { ModelHealthStore } from "../core/health.js";
 import type { ModelHealthSnapshot } from "../core/health.js";
+import {
+  createDefaultCandidateResolver,
+  parseWorkflowSpec,
+  readPersistedWorkflowSnapshot,
+  WorkflowEngine,
+} from "../core/workflow.js";
+import type { WorkflowSnapshot } from "../core/workflow.js";
 import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
@@ -475,6 +484,120 @@ program
       console.error("Health error:", err instanceof Error ? err.message : String(err));
       process.exitCode = 1;
     }
+  });
+
+// Command: workflow (deterministic orchestration state machine, ROADMAP_v0.4 M4)
+interface WorkflowRunCommandOptions {
+  cwd: string;
+  json?: boolean;
+}
+
+interface WorkflowStatusCommandOptions {
+  json?: boolean;
+}
+
+function renderWorkflowTerminal(snapshot: WorkflowSnapshot): void {
+  console.log(`----------------------------------------`);
+  console.log(`Workflow:  ${snapshot.name} (${snapshot.workflowId})`);
+  console.log(`Status:    ${snapshot.status.toUpperCase()}`);
+  for (const stage of snapshot.stages) {
+    console.log(
+      `  Stage ${stage.index + 1}/${snapshot.stages.length} '${stage.name}': ${stage.status}`,
+    );
+    for (const task of stage.tasks) {
+      const detail = task.summary ? ` — ${task.summary}` : task.error ? ` — ${task.error}` : "";
+      console.log(`    task ${task.taskId} (${task.role}): ${task.status}${detail}`);
+    }
+    if (stage.review) {
+      console.log(
+        `    review: initial=${stage.review.initialVerdict} final=${stage.review.verdict} reworkRounds=${stage.review.rounds.length}`,
+      );
+    }
+  }
+  if (snapshot.failure) {
+    console.log(`Failure:   [${snapshot.failure.stageName}] ${snapshot.failure.reason}`);
+  }
+  if (snapshot.evidence) {
+    console.log(`Evidence:  [${snapshot.evidence.stageName}] ${snapshot.evidence.reason}`);
+  }
+  console.log(`----------------------------------------`);
+}
+
+const workflowProgram = program
+  .command("workflow")
+  .description(
+    "Deterministic workflow orchestration: run a JSON spec through the in-process state machine (dispatch → acceptance → review → rework) without an LLM orchestrator",
+  );
+
+workflowProgram
+  .command("run <specPath>")
+  .description(
+    "Run a workflow spec (JSON file matching the run_workflow schema) to its terminal state; exit code: 0 done, 1 failed, 2 escalated",
+  )
+  .option(
+    "-c, --cwd <path>",
+    "Working directory for dispatches and acceptance commands",
+    process.cwd(),
+  )
+  .option(
+    "--json",
+    "Print the terminal snapshot as machine-readable JSON on stdout (progress goes to stderr)",
+    false,
+  )
+  .action(async (specPath: string, options: WorkflowRunCommandOptions) => {
+    try {
+      const parsed = parseWorkflowSpec(JSON.parse(fs.readFileSync(specPath, "utf-8")));
+      if (!parsed.success || !parsed.spec) {
+        console.error(`Invalid workflow spec '${specPath}':`);
+        for (const issue of parsed.issues) console.error(`  - ${issue}`);
+        process.exitCode = 1;
+        return;
+      }
+      // Same default wiring the MCP server uses: the BackgroundDispatchService
+      // provides registry persistence, the stalled watchdog and cancel support.
+      const background = new BackgroundDispatchService();
+      const reported = new Map<number, string>();
+      const engine = new WorkflowEngine(parsed.spec, {
+        dispatch: defaultRunner,
+        background,
+        cwd: options.cwd,
+        candidateResolver: createDefaultCandidateResolver(defaultRunner, options.cwd),
+        onUpdate: (snapshot) => {
+          for (const stage of snapshot.stages) {
+            if (reported.get(stage.index) === stage.status) continue;
+            reported.set(stage.index, stage.status);
+            const line = `[AgentMesh] stage ${stage.index + 1}/${snapshot.stages.length} '${stage.name}': ${stage.status}`;
+            if (options.json) process.stderr.write(`${line}\n`);
+            else console.log(line);
+          }
+        },
+      });
+      console.log(`[AgentMesh] Workflow '${parsed.spec.name}' started: ${engine.id}`);
+      const snapshot = await engine.run();
+      if (options.json) console.log(JSON.stringify(snapshot, null, 2));
+      else renderWorkflowTerminal(snapshot);
+      if (snapshot.status !== "done") {
+        process.exitCode = snapshot.status === "escalated" ? 2 : 1;
+      }
+    } catch (err) {
+      console.error("Workflow error:", err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
+  });
+
+workflowProgram
+  .command("status <workflowId>")
+  .description("Show the latest persisted workflow snapshot (read-only, survives restarts)")
+  .option("--json", "Print the raw persisted snapshot as JSON", false)
+  .action((workflowId: string, options: WorkflowStatusCommandOptions) => {
+    const snapshot = readPersistedWorkflowSnapshot(workflowId);
+    if (!snapshot) {
+      console.error(`No persisted workflow state found for '${workflowId}'.`);
+      process.exitCode = 1;
+      return;
+    }
+    if (options.json) console.log(JSON.stringify(snapshot, null, 2));
+    else renderWorkflowTerminal(snapshot);
   });
 
 // Command: doctor (read-only aggregate diagnostics)

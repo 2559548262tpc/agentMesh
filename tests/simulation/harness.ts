@@ -292,7 +292,18 @@ export async function createSimulationHarness(
       else process.env.CODEX_BIN = originalCodexBin;
       await closeTransportsSafe();
       for (const dir of [homeDir, workDir, binDir]) {
-        fs.rmSync(dir, { recursive: true, force: true });
+        // Windows: a just-exited vendor child's cwd handle can lag the exit
+        // event, failing the removal with EBUSY/ENOTEMPTY; retry briefly
+        // instead of failing teardown.
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            fs.rmSync(dir, { recursive: true, force: true });
+            break;
+          } catch (err) {
+            if (attempt >= 10) throw err;
+            await sleep(300);
+          }
+        }
       }
     },
   };
