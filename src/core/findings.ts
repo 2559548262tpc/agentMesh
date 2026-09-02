@@ -1,9 +1,7 @@
 import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { ReviewFinding } from "../agents/types.js";
 import type { SessionHistoryEntry } from "./types.js";
-import { resolveAgentMeshHome } from "./session.js";
+import { defaultStorage, homeFindingsFilePath, resolveAgentMeshHome } from "./storage.js";
 
 /**
  * M3 findings-value tracking: an append-only JSONL store of reviewer findings
@@ -73,20 +71,19 @@ export interface GraduationProposal {
 /** Categories a custom ESLint rule can realistically enforce. */
 const LINTABLE_CATEGORIES: readonly string[] = ["style", "type-safety", "documentation"];
 
-const FINDINGS_FILE_NAME = "findings.jsonl";
-
 /** First line of every buildReworkFixPrompt prompt (P5 bounded rework loop). */
 export const REWORK_PROMPT_MARKER = "# REWORK ROUND";
 
 /** Resolves the findings JSONL path exactly like the metrics file resolution. */
 export function resolveFindingsFilePath(homeDir?: string): string {
-  return path.join(homeDir ?? resolveAgentMeshHome(), FINDINGS_FILE_NAME);
+  return homeFindingsFilePath(homeDir ?? resolveAgentMeshHome());
 }
 
 /**
- * Appends findings records as JSONL lines. Best-effort by design (same
- * boundary as task metrics): an I/O failure warns on stderr and returns false
- * instead of failing the review that produced the findings.
+ * Appends findings records as JSONL lines (one batched append through the
+ * shared StorageService). Best-effort by design (same boundary as task
+ * metrics): an I/O failure warns on stderr and returns false instead of
+ * failing the review that produced the findings.
  */
 export function appendFindings(
   records: readonly FindingRecord[],
@@ -95,9 +92,11 @@ export function appendFindings(
   if (records.length === 0) return true;
   const filePath = resolveFindingsFilePath(options.homeDir);
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const lines = records.map((record) => JSON.stringify(record)).join("\n");
-    fs.appendFileSync(filePath, `${lines}\n`, "utf-8");
+    defaultStorage.appendLines(
+      filePath,
+      records.map((record) => JSON.stringify(record)),
+      { store: "findings" },
+    );
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -180,33 +179,24 @@ function parseFindingRecordLine(lineText: string): FindingRecord | undefined {
 }
 
 /**
- * Reads all persisted findings records. Missing file → empty (cold start);
- * corrupt lines are skipped fail-closed with a stderr warning, mirroring the
- * metrics store convention.
+ * Reads all persisted findings records (through the shared StorageService).
+ * Missing file → empty (cold start); any read failure → empty; corrupt lines
+ * are skipped fail-closed with a stderr warning, mirroring the metrics store
+ * convention.
  */
 export function readFindings(
   options: { homeDir?: string; filePath?: string } = {},
 ): FindingRecord[] {
   const filePath = options.filePath ?? resolveFindingsFilePath(options.homeDir);
-  let raw: string;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    return defaultStorage.readJsonLines(filePath, parseFindingRecordLine, (corruptPath) => {
+      process.stderr.write(
+        `AgentMesh findings '${corruptPath}' contains a corrupt line; it was skipped.\n`,
+      );
+    });
   } catch {
     return [];
   }
-  const records: FindingRecord[] = [];
-  for (const lineText of raw.split("\n")) {
-    if (!lineText.trim()) continue;
-    const parsed = parseFindingRecordLine(lineText);
-    if (parsed) {
-      records.push(parsed);
-    } else {
-      process.stderr.write(
-        `AgentMesh findings '${filePath}' contains a corrupt line; it was skipped.\n`,
-      );
-    }
-  }
-  return records;
 }
 
 /**

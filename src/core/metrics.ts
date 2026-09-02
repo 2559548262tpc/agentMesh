@@ -1,7 +1,5 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import type { AgentRole } from "../agents/types.js";
-import { resolveAgentMeshHome } from "./session.js";
+import { defaultStorage, homeMetricsFilePath, resolveAgentMeshHome } from "./storage.js";
 
 /**
  * M0 metrics-first: one append-only JSONL record per task dispatch or stall
@@ -70,8 +68,6 @@ export interface MetricsAggregate {
   byRole: MetricsGroupStats[];
 }
 
-const METRICS_FILE_NAME = "metrics.jsonl";
-
 const WINDOW_MS: Record<Exclude<MetricsWindow, "all">, number> = {
   "24h": 24 * 60 * 60_000,
   "7d": 7 * 24 * 60 * 60_000,
@@ -89,13 +85,14 @@ const AGENT_ROLES: readonly AgentRole[] = ["worker", "reviewer", "tester"];
 
 /** Resolves the metrics JSONL path exactly like the session storage home resolution. */
 export function resolveMetricsFilePath(homeDir?: string): string {
-  return path.join(homeDir ?? resolveAgentMeshHome(), METRICS_FILE_NAME);
+  return homeMetricsFilePath(homeDir ?? resolveAgentMeshHome());
 }
 
 /**
- * Appends one metrics record as a JSONL line. Best-effort by design (same
- * boundary as context-artifact persistence): an I/O failure warns on stderr
- * and returns false instead of failing the turn that produced the metric.
+ * Appends one metrics record as a JSONL line (through the shared StorageService).
+ * Best-effort by design (same boundary as context-artifact persistence): an
+ * I/O failure warns on stderr and returns false instead of failing the turn
+ * that produced the metric.
  */
 export function appendTaskMetrics(
   record: TaskMetrics,
@@ -103,8 +100,7 @@ export function appendTaskMetrics(
 ): boolean {
   const filePath = resolveMetricsFilePath(options.homeDir);
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf-8");
+    defaultStorage.appendLine(filePath, JSON.stringify(record), { store: "metrics" });
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -169,33 +165,24 @@ function parseTaskMetricsLine(line: string): TaskMetrics | undefined {
 }
 
 /**
- * Reads all persisted metrics records. Missing file → empty (cold start);
- * corrupt lines are skipped fail-closed with a stderr warning, mirroring the
+ * Reads all persisted metrics records (through the shared StorageService).
+ * Missing file → empty (cold start); any read failure → empty; corrupt lines
+ * are skipped fail-closed with a stderr warning, mirroring the
  * corrupt-session quarantine warning style.
  */
 export function readTaskMetrics(
   options: { homeDir?: string; filePath?: string } = {},
 ): TaskMetrics[] {
   const filePath = options.filePath ?? resolveMetricsFilePath(options.homeDir);
-  let raw: string;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    return defaultStorage.readJsonLines(filePath, parseTaskMetricsLine, (corruptPath) => {
+      process.stderr.write(
+        `AgentMesh task metrics '${corruptPath}' contains a corrupt line; it was skipped.\n`,
+      );
+    });
   } catch {
     return [];
   }
-  const records: TaskMetrics[] = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    const parsed = parseTaskMetricsLine(line);
-    if (parsed) {
-      records.push(parsed);
-    } else {
-      process.stderr.write(
-        `AgentMesh task metrics '${filePath}' contains a corrupt line; it was skipped.\n`,
-      );
-    }
-  }
-  return records;
 }
 
 /** Nearest-rank percentile over an ascending-sorted sample. */

@@ -1,8 +1,8 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import { ZodError, z } from "zod";
+import { defaultStorage, homeContextsDirectory, resolveSessionStoragePath } from "./storage.js";
 import type { AgentName, AgentRole } from "../agents/types.js";
 import type {
   BridgeSession,
@@ -190,24 +190,12 @@ export function readSessionSummary(session: BridgeSession): SessionSummary | und
 }
 
 /**
- * Resolves the effective sessions storage path exactly like the SessionManager
- * constructor, without constructing one. Read-only diagnostics (doctor) use
- * this to inspect storage without triggering load-time quarantine side effects.
+ * M6: the home/storage resolution itself lives in storage.ts (the single
+ * owner); both helpers are re-exported here because diagnostics, artifacts and
+ * the UI historically import them from this module. Symbol identities are
+ * unchanged.
  */
-export function resolveSessionStoragePath(): string {
-  return (
-    process.env.AGENTMESH_SESSIONS_FILE || path.join(os.homedir(), ".agentmesh", "sessions.json")
-  );
-}
-
-/**
- * Resolves the AgentMesh home directory (parent of sessions.json) exactly like
- * the storage-path resolution above. Background task artifacts and spill
- * artifacts share this root so AGENTMESH_SESSIONS_FILE relocates all of it.
- */
-export function resolveAgentMeshHome(): string {
-  return path.dirname(resolveSessionStoragePath());
-}
+export { resolveAgentMeshHome, resolveSessionStoragePath } from "./storage.js";
 
 function snapshotSession(session: BridgeSession): BridgeSession {
   return structuredClone(session);
@@ -305,11 +293,10 @@ export class SessionManager {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        if (!fs.existsSync(this.storagePath)) {
-          return;
-        }
-        const raw = fs.readFileSync(this.storagePath, "utf-8");
-        if (!raw.trim()) {
+        // Missing storage file is a cold start; read errors other than ENOENT
+        // propagate into the retry loop below (unchanged semantics).
+        const raw = defaultStorage.readTextFile(this.storagePath);
+        if (raw === undefined || !raw.trim()) {
           return;
         }
         const parsed = z.array(BridgeSessionSchema).parse(JSON.parse(raw));
@@ -353,25 +340,16 @@ export class SessionManager {
   }
 
   /**
-   * Saves current sessions to the persisted storage file atomically.
+   * Saves current sessions to the persisted storage file atomically (through
+   * the shared StorageService; byte shape unchanged: 2-space JSON, no
+   * trailing newline).
    */
   private saveToFile(): void {
     if (!this.persist) return;
     try {
-      const dir = path.dirname(this.storagePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      const data = Array.from(this.sessions.values());
-      const tempFile = `${this.storagePath}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-      fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), "utf-8");
-      try {
-        fs.renameSync(tempFile, this.storagePath);
-      } catch {
-        // Fallback for Windows file locks
-        fs.copyFileSync(tempFile, this.storagePath);
-        fs.unlinkSync(tempFile);
-      }
+      defaultStorage.writeJsonAtomic(this.storagePath, Array.from(this.sessions.values()), {
+        store: "sessions",
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(`Failed to save AgentMesh sessions to '${this.storagePath}': ${message}`, {
@@ -595,11 +573,10 @@ export class SessionManager {
   ): { file: string; bytes: number; sha256: string } | undefined {
     if (!this.persist || !content) return undefined;
     try {
-      const storageDir = path.dirname(this.storagePath);
-      const dir = path.join(storageDir, "contexts", sessionId);
-      fs.mkdirSync(dir, { recursive: true });
+      const dir = path.join(homeContextsDirectory(path.dirname(this.storagePath)), sessionId);
+      defaultStorage.ensureDirectory(dir);
       const fileName = `${String(turnNumber).padStart(3, "0")}.txt`;
-      fs.writeFileSync(path.join(dir, fileName), content, "utf-8");
+      defaultStorage.writeFile(path.join(dir, fileName), content, { store: "contexts" });
       return {
         file: path.join("contexts", sessionId, fileName),
         bytes: Buffer.byteLength(content, "utf-8"),
@@ -630,14 +607,13 @@ export class SessionManager {
   ): { file: string } | undefined {
     if (!this.persist) return undefined;
     try {
-      const storageDir = path.dirname(this.storagePath);
-      const dir = path.join(storageDir, "contexts", sessionId);
-      fs.mkdirSync(dir, { recursive: true });
+      const dir = path.join(homeContextsDirectory(path.dirname(this.storagePath)), sessionId);
+      defaultStorage.ensureDirectory(dir);
       const fileName = `${String(turnNumber).padStart(3, "0")}.artifact.json`;
-      fs.writeFileSync(
+      defaultStorage.writeFile(
         path.join(dir, fileName),
         JSON.stringify({ timestamp: new Date().toISOString(), ...record }, null, 2),
-        "utf-8",
+        { store: "contexts" },
       );
       return { file: path.join("contexts", sessionId, fileName) };
     } catch {

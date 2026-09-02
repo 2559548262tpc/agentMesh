@@ -1,10 +1,15 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as nodePath from "node:path";
 import type { BridgeSession, SessionHistoryEntry, TimelineEntry } from "../core/types.js";
 import type { BackgroundTaskRecord, StoredTaskResult } from "../core/background.js";
 import { isPidAlive } from "../core/background.js";
 import { loadProjectConfig } from "../core/config.js";
+import {
+  defaultStorage,
+  homeSessionsFilePath,
+  taskRegistryFilePath,
+  taskResultFilePath,
+} from "../core/storage.js";
 
 // ---------------------------------------------------------------------------
 // Read-only data access layer for the UI visualization panel.
@@ -37,7 +42,7 @@ export interface DataSourceInspection {
  * directory is abnormal without blocking rendering.
  */
 export function inspectDataSource(homeDir: string): DataSourceInspection {
-  const sessionsFile = nodePath.join(homeDir, "sessions.json");
+  const sessionsFile = homeSessionsFilePath(homeDir);
   const warnings: string[] = [];
 
   if (!fs.existsSync(homeDir) || !fs.statSync(homeDir).isDirectory()) {
@@ -103,23 +108,10 @@ export interface TaskOutputRead {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function readJsonFile(filePath: string): unknown {
-  let raw: string;
-  try {
-    raw = fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return undefined;
-  }
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return undefined;
-  }
-}
-
 function readSessionsFile(homeDir: string): BridgeSession[] {
-  const sessionsPath = nodePath.join(homeDir, "sessions.json");
-  const parsed = readJsonFile(sessionsPath);
+  // Missing or unparsable file → undefined → empty (cold start), identical to
+  // the previous local readJsonFile helper.
+  const parsed = defaultStorage.readJson(homeSessionsFilePath(homeDir));
   if (!Array.isArray(parsed)) return [];
   return parsed.filter(
     (entry): entry is BridgeSession =>
@@ -276,13 +268,14 @@ export function getSession(homeDir: string, id: string): BridgeSession | undefin
 // ---------------------------------------------------------------------------
 
 function parseRegistryLines(homeDir: string): BackgroundTaskRecord[] {
-  const registryPath = nodePath.join(homeDir, "tasks", "registry.jsonl");
-  let raw: string;
+  const registryPath = taskRegistryFilePath(homeDir);
+  let raw: string | undefined;
   try {
-    raw = fs.readFileSync(registryPath, "utf-8");
+    raw = defaultStorage.readTextFile(registryPath);
   } catch {
     return [];
   }
+  if (raw === undefined) return [];
   const records: BackgroundTaskRecord[] = [];
   for (const line of raw.split("\n")) {
     if (!line.trim()) continue;
@@ -315,8 +308,8 @@ async function readStoredResult(
   homeDir: string,
   taskId: string,
 ): Promise<StoredTaskResult | undefined> {
-  const resultPath = nodePath.join(homeDir, "tasks", `${taskId}.result.json`);
-  const raw = await fsp.readFile(resultPath, "utf-8").catch(() => undefined);
+  const resultPath = taskResultFilePath(homeDir, taskId);
+  const raw = await defaultStorage.readTextFileAsync(resultPath).catch(() => undefined);
   if (!raw) return undefined;
   try {
     const parsed: unknown = JSON.parse(raw);

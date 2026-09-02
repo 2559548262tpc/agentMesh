@@ -1,6 +1,4 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { resolveAgentMeshHome } from "./session.js";
+import { defaultStorage, homeHealthFilePath, resolveAgentMeshHome } from "./storage.js";
 import type { AgentTier } from "./config.js";
 
 /**
@@ -39,11 +37,9 @@ export const DEFAULT_HEALTH_HALF_LIFE_MS = 24 * 60 * 60_000;
 /** Rolling latency-sample bound per agent+model (p50/p95 input). */
 export const MAX_DURATION_SAMPLES = 100;
 
-const HEALTH_FILE_NAME = "health.jsonl";
-
 /** Resolves the health JSONL path exactly like the metrics file resolution. */
 export function resolveHealthFilePath(homeDir?: string): string {
-  return path.join(homeDir ?? resolveAgentMeshHome(), HEALTH_FILE_NAME);
+  return homeHealthFilePath(homeDir ?? resolveAgentMeshHome());
 }
 
 export interface ModelHealthStoreOptions {
@@ -209,33 +205,24 @@ function parseHealthLine(line: string): HealthLine | undefined {
 }
 
 /**
- * Reads all persisted health lines. Missing file → empty (cold start); corrupt
- * lines are skipped fail-closed with a stderr warning, mirroring the metrics
- * reader behavior.
+ * Reads all persisted health lines (through the shared StorageService).
+ * Missing file → empty (cold start); any read failure → empty; corrupt lines
+ * are skipped fail-closed with a stderr warning, mirroring the metrics reader
+ * behavior.
  */
 export function readHealthLines(
   options: { homeDir?: string; filePath?: string } = {},
 ): HealthLine[] {
   const filePath = options.filePath ?? resolveHealthFilePath(options.homeDir);
-  let raw: string;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    return defaultStorage.readJsonLines(filePath, parseHealthLine, (corruptPath) => {
+      process.stderr.write(
+        `AgentMesh model health '${corruptPath}' contains a corrupt line; it was skipped.\n`,
+      );
+    });
   } catch {
     return [];
   }
-  const lines: HealthLine[] = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    const parsed = parseHealthLine(line);
-    if (parsed) {
-      lines.push(parsed);
-    } else {
-      process.stderr.write(
-        `AgentMesh model health '${filePath}' contains a corrupt line; it was skipped.\n`,
-      );
-    }
-  }
-  return lines;
 }
 
 function appendHealthLine(
@@ -244,8 +231,7 @@ function appendHealthLine(
 ): boolean {
   const filePath = options.filePath ?? resolveHealthFilePath(options.homeDir);
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.appendFileSync(filePath, `${JSON.stringify(line)}\n`, "utf-8");
+    defaultStorage.appendLine(filePath, JSON.stringify(line), { store: "health" });
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

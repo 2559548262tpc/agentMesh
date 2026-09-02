@@ -28,7 +28,7 @@ import type { HealthWeightedCandidate } from "./health.js";
 import type { ErrorCode } from "./types.js";
 import type { BackgroundDispatchService } from "../mcp/tools.js";
 import type { StoredTaskResult } from "./background.js";
-import { resolveAgentMeshHome } from "./session.js";
+import { defaultStorage, homeWorkflowsFilePath, resolveAgentMeshHome } from "./storage.js";
 
 /**
  * M4 deterministic orchestration state machine (ROADMAP_v0.4 M4).
@@ -61,7 +61,6 @@ const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 600_000;
 const TERMINAL_RECHECK_CAP_MS = 30_000;
 /** Upstream summary lines injected per upstream stage. */
 const MAX_UPSTREAM_SUMMARY_CHARS = 2_000;
-const WORKFLOW_FILE_NAME = "workflows.jsonl";
 
 const WorkflowRoleSchema = z.enum(["worker", "reviewer", "tester"]);
 
@@ -452,14 +451,13 @@ function truncateSummary(summary: string): string {
 
 /** Resolves the workflows.jsonl path exactly like the metrics file resolution. */
 export function resolveWorkflowFilePath(homeDir?: string): string {
-  return path.join(homeDir ?? resolveAgentMeshHome(), WORKFLOW_FILE_NAME);
+  return homeWorkflowsFilePath(homeDir ?? resolveAgentMeshHome());
 }
 
 function appendWorkflowSnapshot(snapshot: WorkflowSnapshot, homeDir: string | undefined): boolean {
   const filePath = resolveWorkflowFilePath(homeDir);
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.appendFileSync(filePath, `${JSON.stringify(snapshot)}\n`, "utf-8");
+    defaultStorage.appendLine(filePath, JSON.stringify(snapshot), { store: "workflows" });
     return true;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -514,25 +512,15 @@ export function readPersistedWorkflowSnapshots(
   options: { homeDir?: string; filePath?: string } = {},
 ): WorkflowSnapshot[] {
   const filePath = options.filePath ?? resolveWorkflowFilePath(options.homeDir);
-  let raw: string;
   try {
-    raw = fs.readFileSync(filePath, "utf-8");
+    return defaultStorage.readJsonLines(filePath, parseWorkflowSnapshotLine, (corruptPath) => {
+      process.stderr.write(
+        `AgentMesh workflow state '${corruptPath}' contains a corrupt line; it was skipped.\n`,
+      );
+    });
   } catch {
     return [];
   }
-  const records: WorkflowSnapshot[] = [];
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    const parsed = parseWorkflowSnapshotLine(line);
-    if (parsed) {
-      records.push(parsed);
-    } else {
-      process.stderr.write(
-        `AgentMesh workflow state '${filePath}' contains a corrupt line; it was skipped.\n`,
-      );
-    }
-  }
-  return records;
 }
 
 /** Latest persisted snapshot for one workflowId (survives process restarts). */

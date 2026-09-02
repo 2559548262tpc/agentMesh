@@ -10,6 +10,7 @@ import type {
   TransportMode,
 } from "../agents/types.js";
 import { findProjectConfigPath } from "./config.js";
+import { defaultStorage } from "./storage.js";
 
 const CapabilityValueSchema = z
   .object({
@@ -126,7 +127,7 @@ export function generateCapabilities(
   const capabilityPath = findCapabilitiesPath(startDirectory);
   if (!capabilityPath)
     throw new Error("No .agentmesh/config.json found within the current Git repository.");
-  if (fs.existsSync(capabilityPath) && !force) {
+  if (defaultStorage.exists(capabilityPath) && !force) {
     const existing = readCapabilities(startDirectory);
     return { path: capabilityPath, created: false, capabilities: existing };
   }
@@ -140,10 +141,13 @@ export function generateCapabilities(
       commands: ["codex --help", "agy --help", "opencode --help", "claude --help"],
     },
   };
-  fs.mkdirSync(path.dirname(capabilityPath), { recursive: true });
-  const temporaryPath = `${capabilityPath}.tmp-${process.pid}`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  fs.renameSync(temporaryPath, capabilityPath);
+  // Atomic publish through the shared StorageService; byte shape unchanged
+  // (2-space JSON + trailing newline) and mode 0o600 preserved on the temp file.
+  defaultStorage.writeJsonAtomic(capabilityPath, value, {
+    store: "capabilities",
+    trailingNewline: true,
+    mode: 0o600,
+  });
   return { path: capabilityPath, created: true, capabilities: value };
 }
 

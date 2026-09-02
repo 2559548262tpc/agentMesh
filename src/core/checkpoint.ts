@@ -1,7 +1,6 @@
 import * as crypto from "node:crypto";
-import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { resolveAgentMeshHome } from "./session.js";
+import { defaultStorage, homeCheckpointsDirectory, resolveAgentMeshHome } from "./storage.js";
 import type { UsageInfo } from "../agents/types.js";
 
 /**
@@ -104,7 +103,7 @@ export class CheckpointStore {
   private readonly now: () => number;
 
   constructor(options: CheckpointStoreOptions = {}) {
-    this.root = path.join(options.homeDir ?? resolveAgentMeshHome(), "checkpoints");
+    this.root = homeCheckpointsDirectory(options.homeDir ?? resolveAgentMeshHome());
     this.now = options.now ?? Date.now;
   }
 
@@ -151,28 +150,26 @@ export class CheckpointStore {
       createdAtMs: this.now(),
     };
     const filePath = this.checkpointPath(checkpointId, bucket);
-    await fsp.mkdir(path.dirname(filePath), { recursive: true });
+    defaultStorage.ensureDirectory(path.dirname(filePath));
     // 'wx' keeps a rerun from overwriting the first recovery evidence.
-    // Atomic publish (temp + rename) so a concurrent reader can never observe
-    // a half-written checkpoint (P-R14-3 follow-up; same pattern as the
-    // background registry rewrite).
-    const tempFile = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    await fsp.writeFile(tempFile, JSON.stringify(record, null, 2), {
-      encoding: "utf-8",
-      flag: "wx",
-    });
-    await fsp.rename(tempFile, filePath).catch(async (renameErr) => {
-      // Windows rename can fail under concurrent readers; fall back to copy.
-      await fsp.copyFile(tempFile, filePath);
-      await fsp.unlink(tempFile).catch(() => {});
-      if (renameErr instanceof Error) throw renameErr;
+    // Atomic publish (temp + rename) through the shared StorageService so a
+    // concurrent reader can never observe a half-written checkpoint (P-R14-3
+    // follow-up; same pattern as the background registry rewrite). The body is
+    // deliberately fully synchronous (no awaits): the whole publish is then
+    // uninterruptible for the event loop, so a reader polling for the terminal
+    // result can observe the checkpoint only before-or-after the publish, never
+    // mid-write, and the spill cannot fall behind a result-visibility race.
+    // Checkpoint records are best-effort recovery evidence: rename atomicity is
+    // their durability contract, so the data fsync is skipped.
+    defaultStorage.writeFileAtomicSync(filePath, JSON.stringify(record, null, 2), {
+      store: "checkpoints",
+      tempFlag: "wx",
+      fsync: false,
     });
     try {
-      await fsp.appendFile(
-        this.indexPath,
-        `${JSON.stringify({ checkpointId, bucket })}\n`,
-        "utf-8",
-      );
+      defaultStorage.appendLine(this.indexPath, JSON.stringify({ checkpointId, bucket }), {
+        store: "checkpoints",
+      });
     } catch {
       // Index loss degrades lookup to explicit-bucket reads; never fatal.
     }
@@ -181,12 +178,13 @@ export class CheckpointStore {
 
   /** Resolves the bucket recorded for one checkpoint id (newest entry wins). */
   private async resolveBucket(checkpointId: string): Promise<string | undefined> {
-    let raw: string;
+    let raw: string | undefined;
     try {
-      raw = await fsp.readFile(this.indexPath, "utf-8");
+      raw = await defaultStorage.readTextFileAsync(this.indexPath);
     } catch {
       return undefined;
     }
+    if (raw === undefined) return undefined;
     let bucket: string | undefined;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
@@ -206,12 +204,13 @@ export class CheckpointStore {
   public async readCheckpoint(checkpointId: string, bucket?: string): Promise<CheckpointRecord> {
     const resolved = bucket ?? (await this.resolveBucket(checkpointId));
     if (!resolved) throw new CheckpointNotFoundError(checkpointId);
-    let raw: string;
+    let raw: string | undefined;
     try {
-      raw = await fsp.readFile(this.checkpointPath(checkpointId, resolved), "utf-8");
+      raw = await defaultStorage.readTextFileAsync(this.checkpointPath(checkpointId, resolved));
     } catch {
       throw new CheckpointNotFoundError(checkpointId);
     }
+    if (raw === undefined) throw new CheckpointNotFoundError(checkpointId);
     return this.parseRecord(raw, checkpointId);
   }
 
@@ -228,10 +227,12 @@ export class CheckpointStore {
     }
     const consumed: CheckpointRecord = { ...record, consumedAtMs: this.now() };
     // Fail-closed commit: only report success after the tombstone is durable.
-    await fsp.writeFile(
+    // Atomic publish through the shared StorageService (temp + rename) so a
+    // concurrent reader never observes a half-written tombstone.
+    await defaultStorage.writeFileAtomicAsync(
       this.checkpointPath(checkpointId, resolved),
       JSON.stringify(consumed, null, 2),
-      "utf-8",
+      { store: "checkpoints" },
     );
     return consumed;
   }

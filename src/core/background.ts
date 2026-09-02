@@ -1,7 +1,13 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
-import * as path from "node:path";
-import { resolveAgentMeshHome } from "./session.js";
+import {
+  defaultStorage,
+  homeTasksDirectory,
+  resolveAgentMeshHome,
+  taskOutputFilePath,
+  taskRegistryFilePath,
+  taskResultFilePath,
+} from "./storage.js";
 import { appendTaskMetrics } from "./metrics.js";
 import { appendStallEvent } from "./health.js";
 import type { AgentMeshEventBus } from "./events.js";
@@ -276,6 +282,7 @@ export interface BackgroundRegistryOptions {
 }
 
 export class BackgroundTaskRegistry {
+  private readonly homeDir: string;
   private readonly tasksDir: string;
   private readonly registryFile: string;
   private readonly now: () => number;
@@ -291,9 +298,9 @@ export class BackgroundTaskRegistry {
   private watchdogTimer: NodeJS.Timeout | undefined;
 
   constructor(options: BackgroundRegistryOptions = {}) {
-    const homeDir = options.homeDir ?? resolveAgentMeshHome();
-    this.tasksDir = path.join(homeDir, "tasks");
-    this.registryFile = path.join(this.tasksDir, "registry.jsonl");
+    this.homeDir = options.homeDir ?? resolveAgentMeshHome();
+    this.tasksDir = homeTasksDirectory(this.homeDir);
+    this.registryFile = taskRegistryFilePath(this.homeDir);
     this.now = options.now ?? Date.now;
     this.pidAlive = options.isPidAlive ?? isPidAlive;
     this._eventBus = options.eventBus;
@@ -327,11 +334,11 @@ export class BackgroundTaskRegistry {
   }
 
   public outputFilePath(taskId: string): string {
-    return path.join(this.tasksDir, `${taskId}.output`);
+    return taskOutputFilePath(this.homeDir, taskId);
   }
 
   private resultFilePath(taskId: string): string {
-    return path.join(this.tasksDir, `${taskId}.result.json`);
+    return taskResultFilePath(this.homeDir, taskId);
   }
 
   /**
@@ -340,12 +347,12 @@ export class BackgroundTaskRegistry {
    * after launch still leaves a recoverable trace.
    */
   public registerTask(record: BackgroundTaskRecord): void {
-    fs.mkdirSync(this.tasksDir, { recursive: true });
+    defaultStorage.ensureDirectory(this.tasksDir);
     // Eagerly create the declared output capture (P-R14-3): the dispatch
     // response promises this path, so it must exist even if the vendor never
     // writes a byte before a crash.
-    fs.writeFileSync(record.outputFile, "", { flag: "a" });
-    fs.appendFileSync(this.registryFile, `${JSON.stringify(record)}\n`, "utf-8");
+    defaultStorage.writeFile(record.outputFile, "", { store: "tasks", flag: "a" });
+    defaultStorage.appendLine(this.registryFile, JSON.stringify(record), { store: "tasks" });
     this.active.set(record.taskId, { ...record });
     this.ensureWatchdogTimer();
     this._eventBus?.emit({
@@ -367,29 +374,20 @@ export class BackgroundTaskRegistry {
   }
 
   private readPersistedRecords(): BackgroundTaskRecord[] {
-    let raw: string;
-    try {
-      raw = fs.readFileSync(this.registryFile, "utf-8");
-    } catch {
-      return [];
-    }
-    const records: BackgroundTaskRecord[] = [];
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      // Corrupt lines are skipped, never fatal: the registry must stay readable.
-      const parsed = parseRegistryLine(line);
-      if (parsed) records.push(parsed);
-    }
-    return records;
+    // Corrupt lines are skipped silently, never fatal: the registry must stay
+    // readable (same convention as before; parseRegistryLine returns undefined
+    // for malformed input).
+    return defaultStorage.readJsonLines(this.registryFile, parseRegistryLine);
   }
 
   public async readStoredResult(taskId: string): Promise<StoredTaskResult | undefined> {
-    let raw: string;
+    let raw: string | undefined;
     try {
-      raw = await fsp.readFile(this.resultFilePath(taskId), "utf-8");
+      raw = await defaultStorage.readTextFileAsync(this.resultFilePath(taskId));
     } catch {
       return undefined;
     }
+    if (raw === undefined) return undefined;
     try {
       const parsed: unknown = JSON.parse(raw);
       if (typeof parsed !== "object" || parsed === null) return undefined;
@@ -418,8 +416,13 @@ export class BackgroundTaskRegistry {
 
   /** Completion callback target: persists the terminal outcome atomically enough for readers. */
   public async writeStoredResult(result: StoredTaskResult): Promise<void> {
-    fs.mkdirSync(this.tasksDir, { recursive: true });
-    await fsp.writeFile(this.resultFilePath(result.taskId), JSON.stringify(result), "utf-8");
+    // Atomic temp+rename publish (shared StorageService) so pollTask readers
+    // never observe a half-written result.
+    await defaultStorage.writeFileAtomicAsync(
+      this.resultFilePath(result.taskId),
+      JSON.stringify(result),
+      { store: "tasks" },
+    );
     this._eventBus?.emit({
       type: "task.completed",
       taskId: result.taskId,
@@ -431,13 +434,13 @@ export class BackgroundTaskRegistry {
   /** Tasks still tracked in this process without a stored terminal result. */
   public listActiveTasks(): BackgroundTaskRecord[] {
     return [...this.active.values()]
-      .filter((record) => !fs.existsSync(this.resultFilePath(record.taskId)))
+      .filter((record) => !defaultStorage.exists(this.resultFilePath(record.taskId)))
       .map((record) => ({ ...record }));
   }
 
   /** True when the task already produced a stored terminal result. */
   public hasStoredResult(taskId: string): boolean {
-    return fs.existsSync(this.resultFilePath(taskId));
+    return defaultStorage.exists(this.resultFilePath(taskId));
   }
 
   /**
@@ -461,7 +464,7 @@ export class BackgroundTaskRegistry {
     // discoverable and the panel never shows a false "被打断" badge.
     const completedByDeadProcess: BackgroundTaskRecord[] = [];
     for (const record of records) {
-      const hasResult = fs.existsSync(this.resultFilePath(record.taskId));
+      const hasResult = defaultStorage.exists(this.resultFilePath(record.taskId));
       if (!this.pidAlive(record.pid)) {
         if (hasResult) {
           completedByDeadProcess.push(record);
@@ -506,20 +509,12 @@ export class BackgroundTaskRegistry {
   }
 
   private async rewriteRegistry(records: BackgroundTaskRecord[]): Promise<void> {
-    fs.mkdirSync(this.tasksDir, { recursive: true });
-    const tempFile = `${this.registryFile}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-    await fsp.writeFile(
-      tempFile,
+    // Atomic temp+rename rewrite (shared StorageService, Windows copy fallback).
+    await defaultStorage.writeFileAtomicAsync(
+      this.registryFile,
       records.map((record) => JSON.stringify(record)).join("\n") + (records.length > 0 ? "\n" : ""),
-      "utf-8",
+      { store: "tasks" },
     );
-    try {
-      await fsp.rename(tempFile, this.registryFile);
-    } catch {
-      // Windows rename can fail under concurrent readers; fall back to copy.
-      await fsp.copyFile(tempFile, this.registryFile);
-      await fsp.unlink(tempFile);
-    }
   }
 
   /**
@@ -571,7 +566,7 @@ export class BackgroundTaskRegistry {
     const newlyStalled: string[] = [];
     for (const [taskId, record] of this.active) {
       if (this.terminatedNotified.has(taskId)) continue;
-      if (fs.existsSync(this.resultFilePath(taskId))) continue;
+      if (defaultStorage.exists(this.resultFilePath(taskId))) continue;
       const handle = this.watchdogConfig?.getActivityHandle?.(taskId);
       const lastOutputAtMs = handle?.getLastOutputAtMs() ?? record.startedAtMs;
       const silence = nowMs - lastOutputAtMs;
@@ -606,11 +601,11 @@ export class BackgroundTaskRegistry {
             startedAt: new Date(record.startedAtMs).toISOString(),
             endedAt: new Date(nowMs).toISOString(),
           },
-          { homeDir: path.dirname(this.tasksDir) },
+          { homeDir: this.homeDir },
         );
         // M2 health: same taskId-keyed stall evidence; the health snapshot
         // attributes it to agent+model via the terminal dispatch record.
-        appendStallEvent({ taskId }, { homeDir: path.dirname(this.tasksDir) });
+        appendStallEvent({ taskId }, { homeDir: this.homeDir });
       }
     }
     if (this.active.size === 0) this.stopWatchdogTimer();
