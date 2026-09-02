@@ -8,6 +8,8 @@ import { generateCapabilities, readCapabilities } from "../core/capabilities.js"
 import { runDoctorChecks } from "../core/diagnostics.js";
 import { aggregateTaskMetrics, readTaskMetrics } from "../core/metrics.js";
 import type { MetricsWindow } from "../core/metrics.js";
+import { ModelHealthStore } from "../core/health.js";
+import type { ModelHealthSnapshot } from "../core/health.js";
 import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
@@ -16,6 +18,7 @@ import {
   parseStatsWindow,
   parseTimeout,
   renderConfigValidationReport,
+  renderHealthReport,
   renderMetricsReport,
   resolveReviewInput,
   resolveRunInput,
@@ -59,6 +62,11 @@ interface DoctorCommandOptions {
 interface StatsCommandOptions {
   json?: boolean;
   window?: MetricsWindow;
+}
+
+interface HealthCommandOptions {
+  json?: boolean;
+  reset?: string;
 }
 
 interface ConfigValidateCommandOptions {
@@ -429,6 +437,42 @@ program
       }
     } catch (err) {
       console.error("Stats error:", err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
+  });
+
+// Command: health (read-only per-model health and manual reset)
+program
+  .command("health")
+  .description(
+    "Show per-model health: decayed score, success/error/stall counts, latency percentiles and quarantine state",
+  )
+  .option("--json", "Emit a machine-readable JSON health snapshot", false)
+  .option(
+    "--reset <model>",
+    "Reset recorded health for one model id (resets every agent that recorded it), then show the remaining snapshot",
+  )
+  .action((options: HealthCommandOptions) => {
+    try {
+      const store = new ModelHealthStore();
+      if (options.reset) {
+        const before = store.snapshot();
+        const matched = before.entries.filter((entry) => entry.model === options.reset).length;
+        store.resetModelHealth({ model: options.reset });
+        console.log(
+          matched > 0
+            ? `Reset health records for model '${options.reset}' (${matched} agent entr${matched === 1 ? "y" : "ies"}).`
+            : `No health records found for model '${options.reset}'.`,
+        );
+      }
+      const snapshot: ModelHealthSnapshot = store.snapshot();
+      if (options.json) {
+        console.log(JSON.stringify(snapshot, null, 2));
+      } else {
+        renderHealthReport(snapshot);
+      }
+    } catch (err) {
+      console.error("Health error:", err instanceof Error ? err.message : String(err));
       process.exitCode = 1;
     }
   });

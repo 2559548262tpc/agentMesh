@@ -3,6 +3,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { resolveAgentMeshHome } from "./session.js";
 import { appendTaskMetrics } from "./metrics.js";
+import { appendStallEvent } from "./health.js";
 import type { AgentMeshEventBus } from "./events.js";
 
 /**
@@ -607,6 +608,9 @@ export class BackgroundTaskRegistry {
           },
           { homeDir: path.dirname(this.tasksDir) },
         );
+        // M2 health: same taskId-keyed stall evidence; the health snapshot
+        // attributes it to agent+model via the terminal dispatch record.
+        appendStallEvent({ taskId }, { homeDir: path.dirname(this.tasksDir) });
       }
     }
     if (this.active.size === 0) this.stopWatchdogTimer();

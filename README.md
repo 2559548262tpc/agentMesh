@@ -105,6 +105,7 @@ agentmesh doctor [cwd]          # 只读聚合诊断（运行时/适配器/配�
 agentmesh sessions              # 查看 Bridge Sessions
 agentmesh session <sessionId>   # 查看单个会话
 agentmesh stats                 # 任务度量聚合（按模型/角色/时间窗的消耗、耗时、stall/cancel 率）
+agentmesh health                # 模型健康度快照（健康分、计数、p50/p95 耗时、熔断隔离状态）
 ```
 
 `agentmesh ui` 启动的面板是只读的可视化层：展示 Bridge Sessions、后台任务树与 Token 用量，数据全部来自磁盘上的 AgentMesh home 目录（`AGENTMESH_SESSIONS_FILE` 或 `~/.agentmesh`），与 MCP serve 进程不共享内存。面板通过 SSE 端点 `GET /api/events` 接收实时变更推送（UI 进程 `fs.watch` 数据目录，磁盘一有变化立即推送；SSE 不可用时自动降级为 30s 轮询），不再依赖固定间隔刷新。
@@ -112,6 +113,10 @@ agentmesh stats                 # 任务度量聚合（按模型/角色/时间�
 `doctor` 不执行任何任务、不消耗额度、不修改任何文件，把分散在 `list`、`config`、`sessions` 中的健康信息与交叉检查一次汇总：Node 版本、适配器可用性（被项目角色引用的缺失二进制会升级为 FAIL）、config schema 校验、Reviewer `safety: enforced` 与 `prompt-only` 适配器的矛盾组合、capabilities.json 版本漂移与无效文件、会话存储损坏/残留锁/隔离痕迹/容量水位、以及 cwd 的 Git 仓库状态。发现会在启动时必然失败的组合时以退出码 1 结束；`--json` 输出机器可读报告供 Orchestrator 或 CI 消费。
 
 `stats` 只读聚合 `<agentmeshHome>/metrics.jsonl` 中的任务级度量（随每次派发终态追加，stall 事件由后台 watchdog 单独记录并按 taskId 归因）：按模型与角色汇总任务数、Token 消耗、p50/p95 耗时、重试率、stall 率与取消数，`--window all|24h|7d` 选择时间窗、`--json` 输出机器可读报告。不执行任务、不消耗额度，供 Orchestrator 做数据驱动的路由与复盘。
+
+`health` 只读聚合 `<agentmeshHome>/health.jsonl` 中的模型健康事件（与 metrics.jsonl 同目录、同样的追加式约定）：每次有模型归因的派发终态按 agent+model 追加一条 success/failure（watchdog 的 stall 事件只带 taskId，快照时按 taskId 归因到对应派发记录）。健康分 = 时间衰减失败率（半衰期默认 24h，带 +1 新近先验：未验证的模型从 1.0 起步、单次新失败封顶 0.5、闲置旧失败随时间自动松弛回 1.0）；连续失败达到阈值（默认 3 次，成功清零计数）触发熔断隔离，冷却期（默认 30min）届满自动解除，隔离中的模型不参与候选排序。`--json` 输出机器可读快照；`--reset <model>` 以追加 reset 墓志铭的方式手动清零指定模型记录（日志保持 append-only，不重写历史）。不执行任务、不消耗额度。
+
+失败升级提示（`hint.nextCandidates`，附在可升级失败的 MCP 返回 warning 中，≤3 个）自 M2 起按健康度重排：候选顺序 = tier 匹配 → 健康分 → costLevel（无健康数据的候选按满分 1.0 参与，未验证不等于不健康）；被熔断隔离的候选整个排除，仅当所有候选都被隔离时才恢复原序并在 warning 中披露为最后手段——健康度只影响排序，永不永久禁用某个 agent。没有模型归因的轮次（未请求 model）不记录健康事件；客户端取消/断连不计为模型故障，watchdog 终止与超时按 stall 计（与 stall 事件行按 taskId 去重，不双计）。
 
 直接执行仅用于排查 MCP、适配器或 CLI 参数问题：
 

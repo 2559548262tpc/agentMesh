@@ -5,6 +5,7 @@ import type { AgentRole, TransportMode } from "../agents/types.js";
 import type { AgentMeshProjectConfig, ConfigParseIssue } from "../core/config.js";
 import { findProjectConfigPath, parseProjectConfigText } from "../core/config.js";
 import type { MetricsAggregate, MetricsGroupStats, MetricsWindow } from "../core/metrics.js";
+import type { ModelHealthEntry, ModelHealthSnapshot } from "../core/health.js";
 
 export const MAX_TIMEOUT_MS = 3_600_000;
 
@@ -86,6 +87,55 @@ export function renderMetricsReport(aggregate: MetricsAggregate): void {
   if (aggregate.unattributedStallEvents > 0) {
     console.log(
       `\nNote: ${aggregate.unattributedStallEvents} stall event(s) could not be attributed to a dispatch record.`,
+    );
+  }
+  console.log();
+}
+
+const HEALTH_TABLE_WIDTH = 110;
+
+function formatHealthQuarantine(entry: ModelHealthEntry): string {
+  if (!entry.quarantined) return "healthy";
+  const minutesLeft = Math.max(0, Math.ceil((entry.cooldownRemainingMs ?? 0) / 60_000));
+  return `QUARANTINED (${minutesLeft}m cooldown left)`;
+}
+
+/** Renders the `agentmesh health` report; the full snapshot lives in --json output. */
+export function renderHealthReport(snapshot: ModelHealthSnapshot): void {
+  console.log(`\nAgentMesh Model Health (as of ${new Date(snapshot.nowMs).toISOString()})`);
+  if (snapshot.entries.length === 0) {
+    console.log("\nNo model health recorded yet.\n");
+    return;
+  }
+  console.log(
+    "AGENT".padEnd(14) +
+      "MODEL".padEnd(36) +
+      "SCORE".padEnd(8) +
+      "OK".padEnd(8) +
+      "ERR".padEnd(8) +
+      "STALL".padEnd(8) +
+      "P50 MS".padEnd(10) +
+      "P95 MS".padEnd(10) +
+      "QUARANTINE",
+  );
+  console.log("-".repeat(HEALTH_TABLE_WIDTH));
+  for (const entry of snapshot.entries) {
+    console.log(
+      entry.agent.padEnd(14) +
+        entry.model.padEnd(36) +
+        entry.score.toFixed(3).padEnd(8) +
+        String(entry.successCount).padEnd(8) +
+        String(entry.errorCount).padEnd(8) +
+        String(entry.stallCount).padEnd(8) +
+        String(entry.p50DurationMs).padEnd(10) +
+        String(entry.p95DurationMs).padEnd(10) +
+        formatHealthQuarantine(entry),
+    );
+  }
+  const quarantined = snapshot.entries.filter((entry) => entry.quarantined);
+  if (quarantined.length > 0) {
+    console.log(
+      `\n${quarantined.length} model(s) quarantined and excluded from health-ordered candidates until the cooldown elapses.`,
     );
   }
   console.log();

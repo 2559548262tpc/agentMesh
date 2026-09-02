@@ -89,7 +89,10 @@
 
 约定链按 costLevel **升序**排列（弱→中→强）。主模型的预期行为：weak 任务报
 `MODEL_REJECTED` 类错误码时，沿 `zcode → codex-medium → codex-strong` 一次重派到位，而不是
-盲目重试同一目标。（T4.4 的 `hint.nextCandidates` 将自动从该声明生成提示，≤3 个、costLevel 升序。）
+盲目重试同一目标。（`hint.nextCandidates` 会自动从该声明生成提示，≤3 个；自 M2 起按
+**tier 匹配 → 模型健康分 → costLevel** 排序，被熔断隔离的候选会被排除，全部隔离时才按原序
+恢复并在 warning 中披露。健康分来自运行时 `health.jsonl` 事件日志而非人工记忆，数据口径见
+README `agentmesh health` 一节；本表的手动元数据仍决定"谁能当候选"，健康分只决定"先试谁"。）
 
 ## 4. codex Profile v2 角色文件规范（一档一文件）
 

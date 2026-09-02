@@ -23,6 +23,11 @@ import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import { appendTaskMetrics } from "./metrics.js";
 import type { TaskMetricsOutcome } from "./metrics.js";
+import {
+  ModelHealthStore,
+  orderCandidatesByHealth,
+  resolveAgentHealthCandidate,
+} from "./health.js";
 import { FREE_POOL_HINT, validateModelAgainstCatalog } from "./modelCatalog.js";
 import {
   detectDestructiveInstructions,
@@ -768,6 +773,12 @@ export class MultiAgentRunner {
   private readonly compactInFlight = new Map<string, Promise<CompactContextSourceOutcome>>();
   /** T5.2 checkpoint store; overridable for test isolation. */
   private readonly checkpoints: CheckpointStore;
+  /**
+   * M2 model-health store; co-located with the session storage like the M0
+   * metrics store. Undefined (and health recording skipped) when persistence
+   * is disabled, mirroring the metrics seam.
+   */
+  private healthStore: ModelHealthStore | undefined;
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
@@ -1474,7 +1485,7 @@ export class MultiAgentRunner {
         result.status === "failed" &&
         UPGRADEABLE_ERROR_CODES.includes(result.errorCode as ErrorCode)
       ) {
-        const nextCandidates = this.buildUpgradeHint({
+        const hint = this.buildUpgradeHint({
           declaredAgentKey: selectedAgent,
           canonicalAgent: adapter.name,
           requestedModel: effectiveRequestedModel,
@@ -1482,10 +1493,14 @@ export class MultiAgentRunner {
           transportUsed: result.transportUsed,
           startDirectory: configCwd,
         });
-        if (nextCandidates.length) {
-          const note =
-            `hint.nextCandidates=[${nextCandidates.join(", ")}] (upgrade suggestions ordered by costLevel; ` +
-            "the decision stays with the orchestrator — nothing is auto-redelivered)";
+        if (hint.keys.length) {
+          const note = [
+            `hint.nextCandidates=[${hint.keys.join(", ")}] (upgrade suggestions ordered by tier fit, model health, then costLevel; ` +
+              "the decision stays with the orchestrator — nothing is auto-redelivered)",
+            hint.warning,
+          ]
+            .filter(Boolean)
+            .join(" ");
           result.warning = [result.warning, note].filter(Boolean).join(" ");
         }
       }
@@ -2034,12 +2049,16 @@ export class MultiAgentRunner {
   }
 
   /**
-   * T4.4 failure-upgrade hint builder. When a dispatch failed with an
-   * upgradeable error code and the failed agent declares a candidates chain,
-   * this resolves up to three next-hop suggestions: capability-checked via
-   * evaluateModelOptionSupport (candidates whose transport would ignore the
-   * requested model/effort again are dropped), ordered by declared costLevel
-   * ascending (unmetered entries last, declaration order kept for ties).
+   * T4.4 failure-upgrade hint builder (M2 health-ordered). When a dispatch
+   * failed with an upgradeable error code and the failed agent declares a
+   * candidates chain, this resolves up to three next-hop suggestions:
+   * capability-checked via evaluateModelOptionSupport (candidates whose
+   * transport would ignore the requested model/effort again are dropped), then
+   * ordered by tier fit (declared tier matching the failed entry first),
+   * derived model health score (healthy first, quarantined excluded), and
+   * declared costLevel ascending (unmetered entries last, declaration order
+   * kept for ties). When every candidate is health-quarantined they are
+   * reinstated as a last resort and a warning is returned with them.
    * Purely advisory output — nothing is ever auto-redelivered.
    */
   private buildUpgradeHint(params: {
@@ -2049,17 +2068,17 @@ export class MultiAgentRunner {
     requestedReasoningEffort?: ReasoningEffort;
     transportUsed?: "mcp" | "cli";
     startDirectory?: string;
-  }): string[] {
+  }): { keys: string[]; warning?: string } {
     let metadataMap: Record<string, AgentMetadata> | undefined;
     try {
       metadataMap = loadProjectConfig(params.startDirectory ?? process.cwd())?.config.agents;
     } catch {
-      return [];
+      return { keys: [] };
     }
     const chain =
       metadataMap?.[params.declaredAgentKey]?.candidates ??
       metadataMap?.[params.canonicalAgent]?.candidates;
-    if (!chain?.length) return [];
+    if (!chain?.length) return { keys: [] };
 
     let capabilities: CapabilitiesFile["capabilities"];
     try {
@@ -2105,17 +2124,41 @@ export class MultiAgentRunner {
       );
     };
 
-    return chain
-      .filter((key) => {
-        if (key === params.declaredAgentKey || key === params.canonicalAgent) return false;
-        const base = baseOf(key);
-        return base !== params.canonicalAgent;
-      })
-      .filter(meetsCapability)
-      .map((key) => ({ key, cost: metadataMap?.[key]?.costLevel }))
-      .sort((a, b) => (a.cost ?? Number.POSITIVE_INFINITY) - (b.cost ?? Number.POSITIVE_INFINITY))
-      .slice(0, MAX_UPGRADE_HINTS)
-      .map((entry) => entry.key);
+    // M2 health signals: derived from the health.jsonl event log when session
+    // persistence is enabled; without it the ordering degrades to tier/costLevel.
+    const healthSnapshot = this.sessionManager.storageDirectory
+      ? (this.healthStore ??= new ModelHealthStore({
+          homeDir: this.sessionManager.storageDirectory,
+        })).snapshot().entries
+      : undefined;
+    const healthOf = healthSnapshot
+      ? (key: string) => {
+          const base = baseOf(key);
+          return base ? resolveAgentHealthCandidate(healthSnapshot, base) : undefined;
+        }
+      : undefined;
+
+    const ordered = orderCandidatesByHealth({
+      candidates: chain
+        .filter((key) => {
+          if (key === params.declaredAgentKey || key === params.canonicalAgent) return false;
+          const base = baseOf(key);
+          return base !== params.canonicalAgent;
+        })
+        .filter(meetsCapability)
+        .map((key) => ({
+          key,
+          tier: metadataMap?.[key]?.tier,
+          costLevel: metadataMap?.[key]?.costLevel,
+        })),
+      referenceTier:
+        metadataMap?.[params.declaredAgentKey]?.tier ?? metadataMap?.[params.canonicalAgent]?.tier,
+      healthOf,
+    });
+    return {
+      keys: ordered.candidates.slice(0, MAX_UPGRADE_HINTS).map((entry) => entry.key),
+      ...(ordered.warning ? { warning: ordered.warning } : {}),
+    };
   }
 
   /**
@@ -2376,6 +2419,53 @@ export class MultiAgentRunner {
         },
         { homeDir: metricsHome },
       );
+    }
+
+    // M2 health: one additive per-dispatch health event from the same evidence
+    // seam. Turns without an effective model are unattributable and record
+    // nothing; client cancels/disconnects are not model faults. A background
+    // dispatch aborted without a disconnect is a watchdog stall termination
+    // (its stall event line dedupes against this record by taskId at snapshot
+    // time), and a timed-out dispatch is a stall too.
+    const healthModel = options.effectiveModel ?? options.requestedModel;
+    const healthHome = this.sessionManager.storageDirectory;
+    if (healthHome && healthModel) {
+      const health = (this.healthStore ??= new ModelHealthStore({ homeDir: healthHome }));
+      if (result.status === "success") {
+        health.recordSuccess({
+          agent: session.agent,
+          model: healthModel,
+          durationMs: result.durationMs ?? 0,
+          taskId: options.bgTaskId,
+        });
+      } else if (result.status === "failed") {
+        if (result.timedOut) {
+          health.recordFailure("stall", {
+            agent: session.agent,
+            model: healthModel,
+            durationMs: result.durationMs ?? 0,
+            taskId: options.bgTaskId,
+          });
+        } else if (!result.aborted && result.errorCode !== "CANCELLED") {
+          health.recordFailure("error", {
+            agent: session.agent,
+            model: healthModel,
+            durationMs: result.durationMs ?? 0,
+            taskId: options.bgTaskId,
+          });
+        } else if (
+          options.bgTaskId &&
+          cancelReason !== "client_cancel" &&
+          cancelReason !== "client_disconnect"
+        ) {
+          health.recordFailure("stall", {
+            agent: session.agent,
+            model: healthModel,
+            durationMs: result.durationMs ?? 0,
+            taskId: options.bgTaskId,
+          });
+        }
+      }
     }
   }
 
