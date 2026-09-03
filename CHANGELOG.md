@@ -22,9 +22,7 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - **M6 unified data layer:** a single `StorageService` owns home-directory resolution (including `AGENTMESH_SESSIONS_FILE` relocation), atomic writes (temp+fsync+rename with an fsync opt-out for best-effort evidence), corrupt-line tolerance, and change events; sessions/tasks/metrics/findings/health/workflows/checkpoints/capabilities and the UI's data reads all route through it. Persisted formats and locations are byte-compatible — no migration.
 - `agentmesh config validate` and `doctor` surface the new sandbox safety warnings; the checkpoint spill is published before the terminal result so "result visible ⇒ checkpoint visible" holds structurally.
 
-## Planned (v0.4 roadmap, pending)
-
-- M7 remaining lifecycle primitives: task priorities, dependency DAG scheduling, pause/resume (deferred to a follow-up pass on top of M6).
+- **M7b lifecycle primitives:** `delegate_task` gains `priority` (queue ordering) and `deps` (up to 8 task IDs that must succeed first); an optional per-bridge `maxConcurrentBackgroundTasks` cap (env `AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS`, absent = start-immediately, zero regression) makes the persisted priority queue effective. `poll_task` reports `queued` (with position) and `blocked` (with unmet dep ids); a failed/cancelled/stalled dep fails the dependent with structured `DEP_FAILED` without starting a vendor process. `pause_task` wraps cancel-with-checkpoint so `continue_task` on the same session resumes deliberately paused work. `agentmesh stats --findings` adds the M3 reviewer precision table and graduation proposals (`--min-count`, default 3, `--json`).
 
 ### v0.4 改造方案已定稿于 [ROADMAP_v0.4.md](ROADMAP_v0.4.md)（外视角重构版），里程碑摘要：
 
@@ -35,7 +33,9 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - M4 确定性编排状态机（声明式 WorkflowSpec + `run_workflow`/`get_workflow`，组长只在写 spec 与 ESCALATED 时介入）
 - M5 安全默认翻转（默认最强可用沙箱，prompt-only 需显式信任声明，BREAKING）
 - M6 统一数据层（单一 StorageService 所有者，零迁移）
-- M7 生命周期原语与交接保真（`handoff_diff` 已落地；优先级/依赖 DAG/暂停恢复待后续）
+- M7 生命周期原语与交接保真（全部落地：`handoff_diff`、优先级队列、依赖 DAG、`pause_task`；遗留面板语义跟进项见下文）
+
+**已知跟进项（v0.5 候选）**：排队派发在注册时即发出 `task.started`（"已受理"公告），面板消费方可能把排队任务显示为"已启动"——面板侧需要区分 queued/started 两种事件语义。
 
 ## 0.3.0 - 2026-09-02
 
