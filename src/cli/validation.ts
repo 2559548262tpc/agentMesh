@@ -6,6 +6,7 @@ import type { AgentMeshProjectConfig, ConfigParseIssue } from "../core/config.js
 import { findProjectConfigPath, parseProjectConfigText } from "../core/config.js";
 import type { MetricsAggregate, MetricsGroupStats, MetricsWindow } from "../core/metrics.js";
 import type { ModelHealthEntry, ModelHealthSnapshot } from "../core/health.js";
+import type { GraduationProposal, ReviewerFindingsPrecision } from "../core/findings.js";
 
 export const MAX_TIMEOUT_MS = 3_600_000;
 
@@ -32,6 +33,16 @@ export function parseTimeout(value: string): number {
 export function parseStatsWindow(value: string): MetricsWindow {
   if (value === "all" || value === "24h" || value === "7d") return value;
   throw new InvalidArgumentError("Window must be all, 24h, or 7d.");
+}
+
+export const DEFAULT_STATS_MIN_COUNT = 3;
+
+export function parseStatsMinCount(value: string): number {
+  const minCount = Number(value);
+  if (!Number.isSafeInteger(minCount) || minCount < 1) {
+    throw new InvalidArgumentError("Min count must be a positive integer.");
+  }
+  return minCount;
 }
 
 const METRICS_TABLE_WIDTH = 100;
@@ -88,6 +99,60 @@ export function renderMetricsReport(aggregate: MetricsAggregate): void {
     console.log(
       `\nNote: ${aggregate.unattributedStallEvents} stall event(s) could not be attributed to a dispatch record.`,
     );
+  }
+  console.log();
+}
+
+const FINDINGS_TABLE_WIDTH = 100;
+
+/**
+ * Renders the `agentmesh stats --findings` report: per-reviewer precision and
+ * graduation proposals; the full data lives in --json output.
+ */
+export function renderFindingsReport(report: {
+  precision: ReviewerFindingsPrecision[];
+  graduations: GraduationProposal[];
+  minCount: number;
+}): void {
+  console.log(`\nAgentMesh Reviewer Findings (min count: ${report.minCount})`);
+  if (report.precision.length === 0) {
+    console.log("\nNo reviewer findings recorded yet.\n");
+    return;
+  }
+  console.log("\nReviewer precision:");
+  console.log(
+    "AGENT".padEnd(24) +
+      "TOTAL".padEnd(8) +
+      "CONFIRMED".padEnd(12) +
+      "REJECTED".padEnd(10) +
+      "PRECISION",
+  );
+  console.log("-".repeat(FINDINGS_TABLE_WIDTH));
+  for (const entry of report.precision) {
+    console.log(
+      entry.reviewerAgent.padEnd(24) +
+        String(entry.total).padEnd(8) +
+        String(entry.confirmed).padEnd(12) +
+        String(entry.rejected).padEnd(10) +
+        formatMetricsRate(entry.precision),
+    );
+  }
+  console.log(`\nGraduation proposals (categories with >= ${report.minCount} findings):`);
+  if (report.graduations.length === 0) {
+    console.log("  (no categories reached the minimum count)");
+  } else {
+    console.log(
+      "CATEGORY".padEnd(24) + "COUNT".padEnd(8) + "SAMPLE FINDINGS".padEnd(44) + "SUGGESTED CHECK",
+    );
+    console.log("-".repeat(FINDINGS_TABLE_WIDTH));
+    for (const proposal of report.graduations) {
+      console.log(
+        proposal.category.padEnd(24) +
+          String(proposal.count).padEnd(8) +
+          proposal.sampleFindingIds.join(",").padEnd(44) +
+          proposal.suggestedCheck,
+      );
+    }
   }
   console.log();
 }

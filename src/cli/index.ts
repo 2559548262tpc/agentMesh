@@ -10,6 +10,7 @@ import { generateCapabilities, readCapabilities } from "../core/capabilities.js"
 import { runDoctorChecks } from "../core/diagnostics.js";
 import { aggregateTaskMetrics, readTaskMetrics } from "../core/metrics.js";
 import type { MetricsWindow } from "../core/metrics.js";
+import { aggregateFindingsPrecision, proposeGraduations, readFindings } from "../core/findings.js";
 import { ModelHealthStore } from "../core/health.js";
 import type { ModelHealthSnapshot } from "../core/health.js";
 import {
@@ -22,11 +23,14 @@ import type { WorkflowSnapshot } from "../core/workflow.js";
 import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
+  DEFAULT_STATS_MIN_COUNT,
   parseMode,
   parseRole,
+  parseStatsMinCount,
   parseStatsWindow,
   parseTimeout,
   renderConfigValidationReport,
+  renderFindingsReport,
   renderHealthReport,
   renderMetricsReport,
   resolveReviewInput,
@@ -69,7 +73,9 @@ interface DoctorCommandOptions {
 }
 
 interface StatsCommandOptions {
+  findings?: boolean;
   json?: boolean;
+  minCount?: number;
   window?: MetricsWindow;
 }
 
@@ -430,14 +436,39 @@ program
     console.log();
   });
 
-// Command: stats (read-only task metrics aggregation)
+// Command: stats (read-only task metrics aggregation; --findings for reviewer findings)
 program
   .command("stats")
-  .description("Aggregate recorded task metrics by model and role over a time window")
+  .description(
+    "Aggregate recorded task metrics by model and role over a time window, or reviewer findings precision with --findings",
+  )
   .option("--window <window>", "Time window: all | 24h | 7d", parseStatsWindow, "all")
+  .option(
+    "--findings",
+    "Show reviewer findings precision and graduation proposals instead of task metrics",
+    false,
+  )
+  .option(
+    "--min-count <n>",
+    "Minimum findings per category for graduation proposals (used with --findings)",
+    parseStatsMinCount,
+    DEFAULT_STATS_MIN_COUNT,
+  )
   .option("--json", "Emit machine-readable JSON aggregates", false)
   .action((options: StatsCommandOptions) => {
     try {
+      if (options.findings) {
+        const findings = readFindings();
+        const precision = aggregateFindingsPrecision(findings);
+        const minCount = options.minCount ?? DEFAULT_STATS_MIN_COUNT;
+        const graduations = proposeGraduations(findings, minCount);
+        if (options.json) {
+          console.log(JSON.stringify({ precision, graduations }, null, 2));
+        } else {
+          renderFindingsReport({ precision, graduations, minCount });
+        }
+        return;
+      }
       const aggregate = aggregateTaskMetrics(readTaskMetrics(), { window: options.window });
       if (options.json) {
         console.log(JSON.stringify(aggregate, null, 2));

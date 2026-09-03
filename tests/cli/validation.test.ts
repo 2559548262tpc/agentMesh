@@ -3,19 +3,29 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_STATS_MIN_COUNT,
   MAX_TIMEOUT_MS,
   collectConfigSemanticIssues,
   parseMode,
   parseRole,
+  parseStatsMinCount,
   parseStatsWindow,
   parseTimeout,
   renderConfigValidationReport,
+  renderFindingsReport,
   renderMetricsReport,
   resolveReviewInput,
   resolveRunInput,
   validateConfigFile,
 } from "../../src/cli/validation.js";
 import type { AgentNameResolver } from "../../src/cli/validation.js";
+import {
+  aggregateFindingsPrecision,
+  appendFindings,
+  proposeGraduations,
+  readFindings,
+} from "../../src/core/findings.js";
+import type { FindingRecord } from "../../src/core/findings.js";
 import type { MetricsAggregate } from "../../src/core/metrics.js";
 
 describe("cli/validation", () => {
@@ -149,6 +159,176 @@ describe("cli/stats", () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+});
+
+describe("cli/stats --findings", () => {
+  const createdDirectories: string[] = [];
+
+  function createTempHome(): string {
+    const home = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-stats-findings-")),
+    );
+    createdDirectories.push(home);
+    return home;
+  }
+
+  afterEach(() => {
+    for (const directory of createdDirectories.splice(0)) {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  const baseRecord: FindingRecord = {
+    findingId: "fnd_abc123",
+    sessionId: "bridge-sess_rev1",
+    reviewerAgent: "opencode",
+    category: "security",
+    kind: "security",
+    severity: "high",
+    file: "src/auth.ts",
+    reviewedAt: "2026-09-01T10:00:00.000Z",
+  };
+
+  /** Two confirmed, one rejected security finding plus one open style finding from opencode. */
+  function populateStore(home: string): void {
+    appendFindings(
+      [
+        { ...baseRecord, confirmed: true },
+        { ...baseRecord, findingId: "fnd_def456", confirmed: true },
+        { ...baseRecord, findingId: "fnd_ghi789", confirmed: false },
+        { ...baseRecord, findingId: "fnd_jkl012", category: "style", kind: "style" },
+        {
+          ...baseRecord,
+          findingId: "fnd_mno345",
+          reviewerAgent: "codex",
+          category: "testing",
+          kind: "defect",
+        },
+      ],
+      { homeDir: home },
+    );
+  }
+
+  it("accepts positive integer min counts and rejects others", () => {
+    expect(DEFAULT_STATS_MIN_COUNT).toBe(3);
+    expect(parseStatsMinCount("3")).toBe(3);
+    expect(parseStatsMinCount("1")).toBe(1);
+    for (const invalid of ["0", "-1", "1.5", "abc", ""]) {
+      expect(() => parseStatsMinCount(invalid)).toThrow("Min count must be a positive integer.");
+    }
+  });
+
+  it("renders reviewer precision and graduation proposals from a populated temp-dir store", () => {
+    const home = createTempHome();
+    populateStore(home);
+    const findings = readFindings({ homeDir: home });
+    const precision = aggregateFindingsPrecision(findings);
+    const graduations = proposeGraduations(findings, 3);
+    expect(precision).toEqual([
+      { reviewerAgent: "opencode", total: 4, confirmed: 2, rejected: 1, precision: 2 / 3 },
+      { reviewerAgent: "codex", total: 1, confirmed: 0, rejected: 0, precision: 0 },
+    ]);
+    expect(graduations).toEqual([
+      {
+        category: "security",
+        count: 3,
+        sampleFindingIds: ["fnd_abc123", "fnd_def456", "fnd_ghi789"],
+        suggestedCheck: "acceptance-script",
+      },
+    ]);
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      renderFindingsReport({ precision, graduations, minCount: 3 });
+      const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("AgentMesh Reviewer Findings (min count: 3)");
+      expect(output).toContain("Reviewer precision:");
+      expect(output).toContain("opencode");
+      expect(output).toContain("66.7%");
+      expect(output).toContain("0.0%");
+      expect(output).toContain("Graduation proposals (categories with >= 3 findings):");
+      expect(output).toContain("acceptance-script");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("suggests an eslint rule for lintable categories when the minimum count is lowered", () => {
+    const home = createTempHome();
+    populateStore(home);
+    const findings = readFindings({ homeDir: home });
+    const graduations = proposeGraduations(findings, 1);
+    expect(graduations.map((proposal) => [proposal.category, proposal.suggestedCheck])).toEqual([
+      ["security", "acceptance-script"],
+      ["style", "eslint-rule"],
+      ["testing", "acceptance-script"],
+    ]);
+  });
+
+  it("renders the no-proposal note when no category reaches the minimum count", () => {
+    const home = createTempHome();
+    populateStore(home);
+    const findings = readFindings({ homeDir: home });
+    const precision = aggregateFindingsPrecision(findings);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      renderFindingsReport({
+        precision,
+        graduations: proposeGraduations(findings, 5),
+        minCount: 5,
+      });
+      const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("(no categories reached the minimum count)");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("renders an empty state when the findings store is empty", () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      renderFindingsReport({ precision: [], graduations: [], minCount: 3 });
+      const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("No reviewer findings recorded yet.");
+      expect(output).not.toContain("Reviewer precision:");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("emits a machine-readable {precision, graduations} payload for --json", () => {
+    const home = createTempHome();
+    populateStore(home);
+    const findings = readFindings({ homeDir: home });
+    const payload = {
+      precision: aggregateFindingsPrecision(findings),
+      graduations: proposeGraduations(findings, 3),
+    };
+    expect(JSON.parse(JSON.stringify(payload))).toEqual({
+      precision: [
+        { reviewerAgent: "opencode", total: 4, confirmed: 2, rejected: 1, precision: 2 / 3 },
+        { reviewerAgent: "codex", total: 1, confirmed: 0, rejected: 0, precision: 0 },
+      ],
+      graduations: [
+        {
+          category: "security",
+          count: 3,
+          sampleFindingIds: ["fnd_abc123", "fnd_def456", "fnd_ghi789"],
+          suggestedCheck: "acceptance-script",
+        },
+      ],
+    });
+  });
+
+  it("emits empty precision and graduation arrays for a cold-start findings store", () => {
+    const home = createTempHome();
+    const findings = readFindings({ homeDir: home });
+    expect(findings).toEqual([]);
+    expect({
+      precision: aggregateFindingsPrecision(findings),
+      graduations: proposeGraduations(findings, DEFAULT_STATS_MIN_COUNT),
+    }).toEqual({ precision: [], graduations: [] });
   });
 });
 
