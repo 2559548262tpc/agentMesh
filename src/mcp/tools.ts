@@ -20,6 +20,7 @@ import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
 import { createAgentMeshEventBus } from "../core/events.js";
 import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
 import { defaultCheckpointStore } from "../core/checkpoint.js";
+import type { CheckpointRecord } from "../core/checkpoint.js";
 import type { AgentMetadata } from "../core/config.js";
 import { truncateText } from "../core/text.js";
 import {
@@ -196,6 +197,91 @@ export interface BackgroundLaunchParams {
   taskId: string;
   outputFile: string;
   run: (signal: AbortSignal) => Promise<AgentResult>;
+  /**
+   * M7b queue priority (lower runs first, default 0). Only meaningful when a
+   * concurrency cap is configured and the cap is saturated; without a cap the
+   * dispatch starts immediately regardless of priority.
+   */
+  priority?: number;
+  /**
+   * M7b dependency DAG: task ids that must reach terminal SUCCESS before this
+   * dispatch may start. Validated at launch: unknown ids (or the task's own id)
+   * reject the launch with a structured DepValidationError; a dep that has
+   * already terminally failed fails the task immediately with DEP_FAILED.
+   */
+  deps?: string[];
+}
+
+/** Outcome of a launch decision: started immediately, or held in the queue. */
+export interface BackgroundLaunchOutcome {
+  /** False when the dispatch was queued (cap reached or dependencies unmet) or failed immediately. */
+  started: boolean;
+  /** Unmet dependency ids when the dispatch was queued behind its deps. */
+  blockedBy: string[];
+  /** Dep ids already terminally failed at launch; the dispatch failed immediately with DEP_FAILED. */
+  depFailed?: string[];
+}
+
+/** Structured launch rejection for an invalid `deps` list (M7b DAG validation). */
+export class DepValidationError extends Error {
+  readonly code: "DEP_UNKNOWN" | "DEP_SELF";
+  readonly taskId: string;
+  readonly invalidDeps: string[];
+
+  constructor(
+    code: "DEP_UNKNOWN" | "DEP_SELF",
+    taskId: string,
+    invalidDeps: string[],
+    message: string,
+  ) {
+    super(message);
+    this.name = "DepValidationError";
+    this.code = code;
+    this.taskId = taskId;
+    this.invalidDeps = invalidDeps;
+  }
+}
+
+/** One dispatch held out of execution by the queue (cap or unmet deps). */
+interface QueuedDispatchEntry {
+  taskId: string;
+  outputFile: string;
+  run: (signal: AbortSignal) => Promise<AgentResult>;
+  controller: AbortController;
+  priority?: number;
+  deps: string[];
+  /** Dep ids that had not reached terminal SUCCESS at enqueue time. */
+  unmetDeps: string[];
+  enqueuedAtMs: number;
+}
+
+/** M7b in-process queue order: priority ascending (lower runs first), then enqueue instant. */
+function compareQueuedEntries(a: QueuedDispatchEntry, b: QueuedDispatchEntry): number {
+  const priorityDelta = (a.priority ?? 0) - (b.priority ?? 0);
+  if (priorityDelta !== 0) return priorityDelta;
+  return a.enqueuedAtMs - b.enqueuedAtMs;
+}
+
+/**
+ * Reads the optional per-bridge concurrency cap for background dispatches
+ * (M7b). Absent or invalid → undefined, i.e. unlimited: every dispatch starts
+ * immediately, which is exactly the pre-M7b behavior. The cap is a bridge
+ * (process) property, so it is configured through the environment of the
+ * process running the MCP server, next to the other AGENTMESH_* overrides.
+ */
+export function resolveMaxConcurrentBackgroundTasks(
+  env: NodeJS.ProcessEnv = process.env,
+): number | undefined {
+  const raw = env.AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    process.stderr.write(
+      `AgentMesh: AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS='${raw}' is not a positive integer; running without a background concurrency cap.\n`,
+    );
+    return undefined;
+  }
+  return parsed;
 }
 
 /**
@@ -214,15 +300,33 @@ export class BackgroundDispatchService {
     string,
     { promise: Promise<void>; controller: AbortController; outputFile: string }
   >();
+  /**
+   * M7b queue: registered dispatches held out of execution by the concurrency
+   * cap or unmet dependencies. The registry.jsonl queue marker (markTaskQueued)
+   * is the durable cross-restart projection of this map; the run callbacks live
+   * only in memory, so a bridge restart re-derives the queue STATE for status
+   * reporting but can never resume the queued work itself.
+   */
+  private readonly queued = new Map<string, QueuedDispatchEntry>();
+  /** Bridge-level concurrency cap (undefined = unlimited, the pre-M7b default). */
+  private readonly maxConcurrent: number | undefined;
+  /** Re-entrancy guard so concurrent completion/cancel drains cannot double-start. */
+  private draining = false;
+  /**
+   * Checkpoint ids spilled by the completion path, keyed by taskId and consumed
+   * by cancel/pause to hand the one-shot resume baton back to the orchestrator.
+   */
+  private readonly spilledCheckpointIds = new Map<string, string>();
 
   constructor(
     registry: BackgroundTaskRegistry = new BackgroundTaskRegistry({
       eventBus: createAgentMeshEventBus(),
     }),
-    options: { checkpointStore?: typeof defaultCheckpointStore } = {},
+    options: { checkpointStore?: typeof defaultCheckpointStore; maxConcurrentTasks?: number } = {},
   ) {
     this.registry = registry;
     this.checkpoints = options.checkpointStore ?? defaultCheckpointStore;
+    this.maxConcurrent = options.maxConcurrentTasks ?? resolveMaxConcurrentBackgroundTasks();
     this.registry.enableStalledWatchdog({
       getActivityHandle: (taskId) => getActivityHandle(taskId),
       onStalledTerminate: (taskId) => void this.terminateStalledTask(taskId),
@@ -261,7 +365,118 @@ export class BackgroundDispatchService {
     return this.pending.size;
   }
 
-  public launch(params: BackgroundLaunchParams): void {
+  /** Number of dispatches currently held in the M7b queue (cap or unmet deps). */
+  public get queuedCount(): number {
+    return this.queued.size;
+  }
+
+  /**
+   * M7b DAG validation (launch-time, before the registry record is persisted):
+   * rejects self-dependencies (DEP_SELF) and task ids unknown to the registry
+   * and the result store (DEP_UNKNOWN) with a structured DepValidationError.
+   * Returns the deduplicated dep list for the launch call.
+   */
+  public validateDeps(taskId: string, deps: string[] | undefined): string[] {
+    if (!deps || deps.length === 0) return [];
+    const unique = [...new Set(deps)];
+    const selfDeps = unique.filter((dep) => dep === taskId);
+    if (selfDeps.length > 0) {
+      throw new DepValidationError(
+        "DEP_SELF",
+        taskId,
+        selfDeps,
+        `Background task '${taskId}' lists itself in deps; self-dependencies can never run.`,
+      );
+    }
+    const unknown = unique.filter(
+      (dep) => !this.registry.hasStoredResult(dep) && !this.registry.getRegisteredTask(dep),
+    );
+    if (unknown.length > 0) {
+      throw new DepValidationError(
+        "DEP_UNKNOWN",
+        taskId,
+        unknown,
+        `Background task '${taskId}' depends on unknown task id(s): ${unknown.join(", ")}. deps must reference task IDs returned by earlier background dispatches.`,
+      );
+    }
+    return unique;
+  }
+
+  /**
+   * Dependency ruling against the current result store: a dep with a stored
+   * FAILED result is fatal (DEP_FAILED), a dep without a stored COMPLETED
+   * result is still unmet. Deps owned by other bridge processes resolve through
+   * the shared result files.
+   */
+  private evaluateDeps(deps: string[]): { failed: string[]; unmet: string[] } {
+    const failed: string[] = [];
+    const unmet: string[] = [];
+    for (const dep of deps) {
+      const stored = this.registry.readStoredResultSync(dep);
+      if (stored?.status === "failed") failed.push(dep);
+      else if (stored?.status !== "completed") unmet.push(dep);
+    }
+    return { failed, unmet };
+  }
+
+  /**
+   * M7b dispatch decision. Without a concurrency cap and without deps this is
+   * byte-for-byte the pre-M7b behavior: the dispatch starts immediately. With a
+   * saturated cap or unmet deps the dispatch is queued (durable queue marker in
+   * registry.jsonl) until drainQueue frees a slot with all deps SUCCESS. A dep
+   * that has already terminally failed fails the dispatch immediately with
+   * DEP_FAILED instead of ever running.
+   */
+  public launch(params: BackgroundLaunchParams): BackgroundLaunchOutcome {
+    const deps = this.validateDeps(params.taskId, params.deps);
+    const { failed: failedDeps, unmet: unmetDeps } = this.evaluateDeps(deps);
+    const slotFree = this.maxConcurrent === undefined || this.pending.size < this.maxConcurrent;
+
+    if (failedDeps.length > 0) {
+      this.failNow(
+        params.taskId,
+        `DEP_FAILED: dependency task(s) already failed: ${failedDeps.join(", ")}`,
+      );
+      return { started: false, blockedBy: [], depFailed: failedDeps };
+    }
+    if (!slotFree || unmetDeps.length > 0) {
+      const enqueuedAtMs = Date.now();
+      this.registry.markTaskQueued(params.taskId, {
+        priority: params.priority,
+        deps: deps.length > 0 ? deps : undefined,
+        enqueuedAtMs,
+      });
+      this.queued.set(params.taskId, {
+        taskId: params.taskId,
+        outputFile: params.outputFile,
+        run: params.run,
+        controller: new AbortController(),
+        priority: params.priority,
+        deps,
+        unmetDeps,
+        enqueuedAtMs,
+      });
+      return { started: false, blockedBy: unmetDeps };
+    }
+    this.startDispatch(params);
+    return { started: true, blockedBy: [] };
+  }
+
+  /** Records an immediate terminal failure for a dispatch that never ran. */
+  private failNow(taskId: string, error: string): void {
+    this.registry.writeStoredResultSync({
+      taskId,
+      status: "failed",
+      error,
+      completedAtMs: Date.now(),
+    });
+    this.registry.releaseTask(taskId);
+    // Dependents queued behind this failure must be resolved at the next drain.
+    void this.drainQueue();
+  }
+
+  /** The pre-M7b launch body: runs the dispatch callback and records the outcome. */
+  private startDispatch(params: BackgroundLaunchParams): void {
     const controller = new AbortController();
     const promise = (async () => {
       try {
@@ -270,13 +485,14 @@ export class BackgroundDispatchService {
         // structural invariant (readers poll for the result and then read the
         // checkpoint; publishing the result last removes the poll window).
         if (result.status !== "success") {
-          await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
+          const spilled = await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
             bridgeSessionId: result.sessionId,
             reason: controller.signal.aborted ? "cancelled" : "failed",
             summary: result.summary,
             usage: result.usage,
             exitCode: result.exitCode,
           });
+          if (spilled) this.spilledCheckpointIds.set(params.taskId, spilled.checkpointId);
         }
         await this.registry.writeStoredResult({
           taskId: params.taskId,
@@ -285,6 +501,7 @@ export class BackgroundDispatchService {
           finalAnswer: result.finalAnswer,
           error: result.error,
           exitCode: result.exitCode,
+          ...(result.sessionId ? { sessionId: result.sessionId } : {}),
           completedAtMs: Date.now(),
         });
       } catch (err) {
@@ -303,15 +520,71 @@ export class BackgroundDispatchService {
         forgetActivityHandle(params.taskId);
         this.registry.releaseTask(params.taskId);
         this.pending.delete(params.taskId);
+        // M7b: a freed slot (and any dependency resolution this terminal state
+        // implies) may make queued dispatches runnable.
+        void this.drainQueue();
       }
     })();
     this.pending.set(params.taskId, { promise, controller, outputFile: params.outputFile });
   }
 
   /**
+   * M7b queue drain: starts every runnable queued dispatch in (priority, enqueue
+   * time) order while the cap has free slots. A queued dispatch whose dependency
+   * terminally FAILED while it waited is failed with DEP_FAILED (never runs);
+   * one with still-unmet deps stays queued. Serialized by the draining flag —
+   * concurrent completion/cancel drains coalesce into the in-flight pass.
+   */
+  private async drainQueue(): Promise<void> {
+    if (this.draining || this.queued.size === 0) return;
+    this.draining = true;
+    try {
+      for (;;) {
+        const ordered = [...this.queued.values()].sort(compareQueuedEntries);
+        let progressed = false;
+        for (const entry of ordered) {
+          const { failed, unmet } = this.evaluateDeps(entry.deps);
+          if (failed.length > 0) {
+            this.queued.delete(entry.taskId);
+            this.registry.markTaskDequeued(entry.taskId);
+            this.registry.writeStoredResultSync({
+              taskId: entry.taskId,
+              status: "failed",
+              error: `DEP_FAILED: dependency task(s) failed while queued: ${failed.join(", ")}`,
+              completedAtMs: Date.now(),
+            });
+            this.registry.releaseTask(entry.taskId);
+            continue;
+          }
+          if (unmet.length > 0) continue;
+          const slotFree =
+            this.maxConcurrent === undefined || this.pending.size < this.maxConcurrent;
+          if (!slotFree) break;
+          this.queued.delete(entry.taskId);
+          this.registry.markTaskStarted(entry.taskId);
+          this.startDispatch({
+            taskId: entry.taskId,
+            outputFile: entry.outputFile,
+            run: entry.run,
+            priority: entry.priority,
+            deps: entry.deps,
+          });
+          progressed = true;
+          break;
+        }
+        if (!progressed) break;
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  /**
    * P5 T5.2: spills the captured output tail of a dead background dispatch
    * into a checkpoint so continue_task(fromCheckpoint) can resume it.
-   * Best-effort by design; never masks the original failure.
+   * Best-effort by design; never masks the original failure. Returns the
+   * saved checkpoint record (M7b pause/resume needs the id as the resume
+   * baton) or undefined when there was nothing to salvage.
    */
   private async spillFailureCheckpoint(
     taskId: string,
@@ -323,11 +596,11 @@ export class BackgroundDispatchService {
       usage?: AgentResult["usage"];
       exitCode?: number;
     },
-  ): Promise<void> {
+  ): Promise<CheckpointRecord | undefined> {
     try {
       const tail = await readTailSnapshot(outputFile, CHECKPOINT_TAIL_BYTES);
-      if (!tail.trim()) return;
-      await this.checkpoints.saveCheckpoint({
+      if (!tail.trim()) return undefined;
+      return await this.checkpoints.saveCheckpoint({
         taskId,
         bridgeSessionId: meta.bridgeSessionId,
         reason: meta.reason,
@@ -338,15 +611,32 @@ export class BackgroundDispatchService {
       });
     } catch {
       // Best-effort recovery evidence.
+      return undefined;
     }
   }
 
   /**
    * Shutdown path: aborts every running dispatch through their controllers
    * (reusing the runner's tree-termination path) and waits for each to record
-   * its terminal state.
+   * its terminal state. Queued M7b dispatches never started, so they are
+   * recorded as failed "cancelled while queued" instead of being left as
+   * zombie queue markers owned by a dying process (a restart would only be
+   * able to dead-letter them as "interrupted", which misreports never-started
+   * work).
    */
   public async abortAll(reason: string): Promise<void> {
+    const queuedEntries = [...this.queued.values()];
+    this.queued.clear();
+    for (const entry of queuedEntries) {
+      this.registry.markTaskDequeued(entry.taskId);
+      this.registry.writeStoredResultSync({
+        taskId: entry.taskId,
+        status: "failed",
+        error: `cancelled while queued (${reason})`,
+        completedAtMs: Date.now(),
+      });
+      this.registry.releaseTask(entry.taskId);
+    }
     const entries = [...this.pending.values()];
     for (const entry of entries) entry.controller.abort(new Error(reason));
     await Promise.allSettled(entries.map((entry) => entry.promise));
@@ -361,19 +651,48 @@ export class BackgroundDispatchService {
    * Already-terminal tasks are a no-op that reports the current status;
    * unknown tasks raise BackgroundTaskNotFoundError. A task registered by a
    * foreign live bridge (or no longer running without a result) is reported
-   * as NOT_CANCELLABLE instead of being touched cross-process.
+   * as NOT_CANCELLABLE instead of being touched cross-process. A queued M7b
+   * dispatch (never started) leaves the queue and records the cancelled
+   * outcome directly; queued dependents of it are resolved by the drain.
    */
   public async cancel(taskId: string, reason = "client_cancel"): Promise<CancelTaskOutcome> {
     const entry = this.pending.get(taskId);
     if (entry) {
       entry.controller.abort(new Error(`cancelled by client (${reason})`));
       await entry.promise;
+      const stored = await this.registry.readStoredResult(taskId);
+      // The checkpoint spilled by the completion path is the one-shot resume
+      // baton (M7b pause/resume); empty output spills nothing.
+      const checkpointId = this.spilledCheckpointIds.get(taskId);
+      this.spilledCheckpointIds.delete(taskId);
       return {
         taskId,
         status: "cancelled",
         alreadyTerminal: false,
         cancelReason: reason,
-        result: await this.registry.readStoredResult(taskId),
+        ...(checkpointId ? { checkpointId } : {}),
+        result: stored,
+      };
+    }
+    const queuedEntry = this.queued.get(taskId);
+    if (queuedEntry) {
+      this.queued.delete(taskId);
+      this.registry.markTaskDequeued(taskId);
+      this.registry.writeStoredResultSync({
+        taskId,
+        status: "failed",
+        error: `cancelled while queued (${reason})`,
+        completedAtMs: Date.now(),
+      });
+      this.registry.releaseTask(taskId);
+      // The queued cancellation is a terminal dep state for dependents.
+      void this.drainQueue();
+      return {
+        taskId,
+        status: "cancelled",
+        alreadyTerminal: false,
+        cancelReason: reason,
+        result: this.registry.readStoredResultSync(taskId),
       };
     }
     const stored = await this.registry.readStoredResult(taskId);
@@ -397,9 +716,20 @@ export class BackgroundDispatchService {
       `Background task '${taskId}' cannot be cancelled: ${detail}.`,
     );
   }
+
+  /**
+   * M7b pause/resume primitive: pauses a dispatch by cancelling it with reason
+   * "paused" — the exact cancel path (process-tree termination + output-tail
+   * checkpoint spill + terminal outcome). Resumption is the orchestrator's
+   * continue_task(sessionId, fromCheckpoint=<checkpointId>) on the SAME bridge
+   * session, whose id the outcome carries. No vendor SIGSTOP is assumed.
+   */
+  public async pause(taskId: string, reason = "paused"): Promise<CancelTaskOutcome> {
+    return this.cancel(taskId, reason);
+  }
 }
 
-/** Terminal outcome of a cancel_task call. */
+/** Terminal outcome of a cancel_task / pause_task call. */
 export interface CancelTaskOutcome {
   taskId: string;
   /** "cancelled" when this call aborted a running dispatch; otherwise the existing terminal status. */
@@ -408,6 +738,12 @@ export interface CancelTaskOutcome {
   alreadyTerminal: boolean;
   /** Cancel reason carried into the abort signal (existing cancel taxonomy). */
   cancelReason: string;
+  /**
+   * M7b pause/resume baton: the checkpoint id holding the captured output tail
+   * of the aborted dispatch; resume via continue_task(fromCheckpoint). Absent
+   * when nothing was salvageable (no output bytes were ever captured).
+   */
+  checkpointId?: string;
   /** Terminal task result; absent when the owning process died before recording one. */
   result?: StoredTaskResult;
 }
@@ -525,6 +861,28 @@ export const DelegateTaskInputSchema = z.object({
     .describe(
       "Run asynchronously: returns immediately with taskId and outputFile; use poll_task to observe " +
         "progress and collect the terminal result",
+    ),
+  priority: z
+    .number()
+    .int()
+    .min(0)
+    .max(9)
+    .optional()
+    .describe(
+      "M7b background queue priority (0-9, lower runs first, default 0). Only meaningful when the " +
+        "dispatch is queued (AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS saturated or deps unmet); " +
+        "a dispatch that starts immediately ignores it. Ignored without background:true",
+    ),
+  deps: z
+    .array(NonBlankString)
+    .max(16)
+    .optional()
+    .describe(
+      "M7b dependency DAG (background:true only): task IDs from earlier background dispatches that " +
+        "must reach terminal SUCCESS before this dispatch starts. Self or unknown ids are rejected " +
+        "with DEP_SELF/DEP_UNKNOWN; a dependency that already terminally failed fails this task " +
+        "immediately with DEP_FAILED. While waiting, poll_task reports status 'queued' or 'blocked' " +
+        "(with blockedBy) instead of 'running'",
     ),
 });
 
@@ -645,6 +1003,21 @@ export const CancelTaskInputSchema = z.object({
     .optional()
     .describe(
       "Short cancellation reason carried into the terminal outcome and the checkpoint spill (default 'client_cancel')",
+    ),
+});
+
+export const PauseTaskInputSchema = z.object({
+  taskId: NonBlankString.describe(
+    "Background task ID previously returned by delegate_task or review_changes (background:true)",
+  ),
+  reason: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "Short pause reason carried into the terminal outcome and the checkpoint spill (default 'paused')",
     ),
 });
 
@@ -941,6 +1314,34 @@ export function registerMcpTools(
       try {
         if (args.background) {
           const taskId = `bgtask_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+          // M7b DAG validation runs BEFORE the registry record is persisted so
+          // a rejected dispatch leaves no orphan registration behind.
+          let deps: string[] | undefined;
+          try {
+            deps = background.validateDeps(taskId, args.deps);
+          } catch (err) {
+            if (err instanceof DepValidationError) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      {
+                        error: err.code,
+                        taskId: err.taskId,
+                        invalidDeps: err.invalidDeps,
+                        message: err.message,
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+            throw err;
+          }
           const outputFile = background.registry.outputFilePath(taskId);
           background.registry.registerTask({
             taskId,
@@ -948,9 +1349,11 @@ export function registerMcpTools(
             startedAtMs: Date.now(),
             outputFile,
           });
-          background.launch({
+          const launchOutcome = background.launch({
             taskId,
             outputFile,
+            ...(args.priority !== undefined ? { priority: args.priority } : {}),
+            ...(deps && deps.length > 0 ? { deps } : {}),
             run: (signal) =>
               runner.delegateTask({
                 agent: args.agent,
@@ -971,6 +1374,21 @@ export function registerMcpTools(
                 taskActivity: { taskId, outputFile },
               }),
           });
+          // M7b status taxonomy: RUNNING (started), QUEUED (cap or deps; the
+          // blockedBy list distinguishes dependency waiting), or an immediate
+          // DEP_FAILED terminal state the orchestrator must not wait on.
+          const statusLine = launchOutcome.depFailed?.length
+            ? `Status: FAILED (DEP_FAILED: dependency task(s) already failed: ${launchOutcome.depFailed.join(", ")})`
+            : launchOutcome.started
+              ? "Status: RUNNING"
+              : launchOutcome.blockedBy.length > 0
+                ? `Status: QUEUED (blocked by deps: ${launchOutcome.blockedBy.join(", ")})`
+                : "Status: QUEUED (waiting for a free concurrency slot)";
+          const statusGuidance = launchOutcome.depFailed?.length
+            ? "The task failed before execution because a dependency already failed; no re-dispatch of the dependency graph can recover it — dispatch a fresh dependency task first."
+            : launchOutcome.started
+              ? "The task is executing asynchronously; use poll_task to observe."
+              : "The task is registered and waiting in the M7b queue; use poll_task to observe (status 'queued' or 'blocked' with queuePosition/blockedBy until it starts).";
           return {
             content: [
               {
@@ -979,9 +1397,9 @@ export function registerMcpTools(
                   "[Background Task Accepted]",
                   `Task ID: ${taskId}`,
                   `Output File: ${outputFile}`,
-                  "Status: RUNNING",
+                  statusLine,
                   "",
-                  "The task is executing asynchronously; use poll_task to observe.",
+                  statusGuidance,
                   `Call poll_task with taskId="${taskId}" to read incremental output and the terminal result.`,
                   "Long-poll guidance: pass maxWaitMs=30000 so one poll_task call blocks until new output or a terminal state arrives (event-driven) instead of re-polling every few seconds.",
                 ].join("\n"),
@@ -1046,7 +1464,7 @@ export function registerMcpTools(
   // poll_task
   server.tool(
     "poll_task",
-    "Observes a background delegate_task: reports status (running/completed/failed/stalled), the incremental output since a byte offset, and the terminal result once available",
+    "Observes a background delegate_task: reports status (running/queued/blocked/completed/failed/stalled — queued/blocked are M7b queue states carrying queuePosition and blockedBy), the incremental output since a byte offset, and the terminal result once available",
     PollTaskInputSchema.shape,
     async (args: z.infer<typeof PollTaskInputSchema>) => {
       try {
@@ -1178,6 +1596,70 @@ export function registerMcpTools(
             {
               type: "text",
               text: `Bridge Error in cancel_task: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // pause_task — M7b pause/resume primitive
+  server.tool(
+    "pause_task",
+    [
+      "Pauses a running background task by cancelling it with reason 'paused': terminates the full vendor process tree, spills the captured output tail as a one-shot checkpoint, and records the terminal outcome with the owning Bridge session id.",
+      "Resume with continue_task(sessionId=<outcome.result.sessionId>, fromCheckpoint=<outcome.checkpointId>) — the paused work continues on the SAME session with the salvaged partial output injected. A queued (never started) task pauses without a checkpoint; re-dispatch it instead. No vendor SIGSTOP is assumed.",
+    ].join("\n"),
+    PauseTaskInputSchema.shape,
+    async (args: z.infer<typeof PauseTaskInputSchema>) => {
+      try {
+        const outcome = await background.pause(args.taskId, args.reason ?? "paused");
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(outcome, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        if (err instanceof BackgroundTaskNotFoundError) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: "NOT_FOUND", taskId: err.taskId, message: err.message },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (err instanceof BackgroundTaskNotCancellableError) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: "NOT_CANCELLABLE", taskId: err.taskId, message: err.message },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in pause_task: ${errorMsg}`,
             },
           ],
           isError: true,

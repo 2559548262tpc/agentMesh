@@ -117,7 +117,7 @@ agentmesh workflow status <workflowId> [--json]
 
 `doctor` 不执行任何任务、不消耗额度、不修改任何文件，把分散在 `list`、`config`、`sessions` 中的健康信息与交叉检查一次汇总：Node 版本、适配器可用性（被项目角色引用的缺失二进制会升级为 FAIL）、config schema 校验、Reviewer `safety: enforced` 与 `prompt-only` 适配器的矛盾组合、capabilities.json 版本漂移与无效文件、会话存储损坏/残留锁/隔离痕迹/容量水位、以及 cwd 的 Git 仓库状态。发现会在启动时必然失败的组合时以退出码 1 结束；`--json` 输出机器可读报告供 Orchestrator 或 CI 消费。
 
-`stats` 只读聚合 `<agentmeshHome>/metrics.jsonl` 中的任务级度量（随每次派发终态追加，stall 事件由后台 watchdog 单独记录并按 taskId 归因）：按模型与角色汇总任务数、Token 消耗、p50/p95 耗时、重试率、stall 率与取消数，`--window all|24h|7d` 选择时间窗、`--json` 输出机器可读报告。不执行任务、不消耗额度，供 Orchestrator 做数据驱动的路由与复盘。
+`stats` 只读聚合 `<agentmeshHome>/metrics.jsonl` 中的任务级度量（随每次派发终态追加，stall 事件由后台 watchdog 单独记录并按 taskId 归因）：按模型与角色汇总任务数、Token 消耗、p50/p95 耗时、重试率、stall 率与取消数，`--window all|24h|7d` 选择时间窗、`--json` 输出机器可读报告。不执行任务、不消耗额度，供 Orchestrator 做数据驱动的路由与复盘。`stats --findings` 切换到评审发现视图：按评审 Agent 汇总 findings.jsonl 的 total/confirmed/rejected/precision%，并列出出现次数达到 `--min-count <n>`（默认 3）的类别 graduation 提案（eslint-rule / acceptance-script）；`--json` 输出机器可读的 {precision, graduations}。
 
 `health` 只读聚合 `<agentmeshHome>/health.jsonl` 中的模型健康事件（与 metrics.jsonl 同目录、同样的追加式约定）：每次有模型归因的派发终态按 agent+model 追加一条 success/failure（watchdog 的 stall 事件只带 taskId，快照时按 taskId 归因到对应派发记录）。健康分 = 时间衰减失败率（半衰期默认 24h，带 +1 新近先验：未验证的模型从 1.0 起步、单次新失败封顶 0.5、闲置旧失败随时间自动松弛回 1.0）；连续失败达到阈值（默认 3 次，成功清零计数）触发熔断隔离，冷却期（默认 30min）届满自动解除，隔离中的模型不参与候选排序。`--json` 输出机器可读快照；`--reset <model>` 以追加 reset 墓志铭的方式手动清零指定模型记录（日志保持 append-only，不重写历史）。不执行任务、不消耗额度。
 
@@ -256,46 +256,53 @@ agentmesh capabilities show
 
 1. **`delegate_task`**
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
-   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `reviewPaths` (可选，reviewer 角色的树守卫范围限定，见上文), `idempotencyKey` (可选), `background` (可选布尔值)。
+   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `reviewPaths` (可选，reviewer 角色的树守卫范围限定，见上文), `idempotencyKey` (可选), `background` (可选布尔值), `priority` (可选，0-9 整数，仅 `background: true` 时生效), `deps` (可选，≤16 个后台任务 ID，仅 `background: true` 时生效)。
    - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果（返回体附带长轮询指引）。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
+   - **队列与依赖 DAG（M7b）**：设置环境变量 `AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS`（正整数，按 bridge 进程生效；缺省不设上限）后，达到并发上限的派发进入持久化队列（`registry.jsonl` 记录队列标记，bridge 重启后可还原队列状态），返回 `Status: QUEUED (waiting for a free concurrency slot)`。`deps` 声明依赖 DAG：所列任务必须先到达终态 SUCCESS 本任务才会启动；自引用/未知 ID 被 `DEP_SELF`/`DEP_UNKNOWN` 结构化拒绝，依赖已终态失败时本任务立即以 `DEP_FAILED` 失败（不执行）。等待期间返回 `Status: QUEUED (blocked by deps: ...)`。队列按 `(priority, 入队时间)` 排序排水：priority 数值小者先跑（默认 0），同步派发与无上限、无依赖的后台派发行为与 M7b 之前完全一致（priority/deps 被忽略，零回归）。
 2. **`poll_task`**
-   - 观察一个后台 delegate_task：返回 `status` (`running` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore` 以及终态时的 `result`。
+   - 观察一个后台 delegate_task：返回 `status` (`running` | `queued` | `blocked` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore`以及终态时的 `result`。`queued`/`blocked`（M7b）表示派发已注册但被并发上限或未满足依赖扣在队列里，此时附带 `queuePosition`（队列中的 1-based 排位）与 `blockedBy`（尚未 SUCCESS 的依赖 ID 列表，仅 `blocked`）；长轮询会一直等到排队任务真正启动或终态（排队→运行的事件唤醒）。
    - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取), `maxWaitMs` (可选，0-60000，长轮询预算：调用在事件驱动下阻塞直到有新输出或终态，到达上限才返回；推荐 30000，省略则为快速非阻塞状态查询)。
    - **事件驱动长轮询**：任务注册表持有进程内类型化事件总线（`task.started` / `task.output` / `task.completed` / `task.stalled`），长轮询调用在任务活动（事件或输出文件变化）时立即唤醒，而不是固定 100ms 盲轮询；预算上限仍然硬性约束墙钟时间。未指定 `maxWaitMs` 时单次调用内部最多阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
    - **Best-effort 通知**：后台任务达到终态或被标记 stalled 时，MCP Server 会通过标准 `notifications/message`（logging 能力）向宿主推送一条提示（附 taskId 与下一步 poll 指引）。通知不保证送达——不支持或不上浮 logging 消息的宿主会静默忽略；可靠的观察机制始终是长轮询 `poll_task`。
 3. **`cancel_task`**
    - 主动取消一个运行中的后台任务：通过其 abort controller 走与 stalled 看门狗完全相同的终止路径（终止完整 vendor 进程树，Windows `taskkill /T /F`），先把输出尾部溢出为一次性 checkpoint（reason `cancelled`，可经 `continue_task` 的 `fromCheckpoint` 续跑），再落盘 `failed` 终态。
    - 参数：`taskId` (必填), `reason` (可选，≤200 字符，记录进终态结果与 checkpoint，默认 `client_cancel`)。
-   - 已终态的任务是幂等 no-op（返回当前状态、无副作用）；未知 taskId 返回结构化 `NOT_FOUND`；属于其他活跃 bridge 进程（或已不在运行且无落盘结果）的任务返回 `NOT_CANCELLABLE`，不做跨进程操作。
-4. **`review_changes`**
+   - 已终态的任务是幂等 no-op（返回当前状态、无副作用）；未知 taskId 返回结构化 `NOT_FOUND`；属于其他活跃 bridge 进程（或已不在运行且无落盘结果）的任务返回 `NOT_CANCELLABLE`，不做跨进程操作。仍在队列中（从未启动）的 M7b 排队任务直接离开队列并落盘 `failed`（错误注明 cancelled while queued），不会启动 vendor 进程；其排队依赖由下一次队列排水按 `DEP_FAILED` 一并结算。
+4. **`pause_task`**
+   - 暂停/恢复原语（M7b）：把一个运行中的后台任务按取消语义暂停——reason 固定携带 `paused`，走与 `cancel_task` 完全相同的终止路径（终止完整 vendor 进程树），先把输出尾部溢出为一次性 checkpoint（reason `paused`），终态 result 附带 owning Bridge Session ID。
+   - 参数：`taskId` (必填), `reason` (可选，≤200 字符，默认 `paused`)。
+   - 返回与 `cancel_task` 相同的结构化结果（`taskId`/`status`/`alreadyTerminal`/`cancelReason`/`checkpointId`/`result`）。恢复方式：`continue_task(sessionId=<result.sessionId>, fromCheckpoint=<checkpointId>)` —— 暂停的工作在**同一个** Bridge Session 上续跑，抢救出的部分输出注入续跑 prompt 头部；checkpoint 仍是一次性消费令牌。排队中（从未启动）的任务暂停时不产生 checkpoint，直接重新派发即可；不存在对 vendor 进程的 SIGSTOP 假设。
+5. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
    - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `reviewPaths` (可选，树守卫范围限定，见上文), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。
    - **有界返工循环（P5）**：`maxReworkRounds > 0` 时，审查 FAIL 会自动把机器解析的结构化 findings 注入原 Worker 会话（`workerSessionId` 优先；未提供时若 `contextSessionIds` 中恰好只有一个 worker 角色会话则使用之，多个/零个候选时明示不猜），修复后再以全新 Reviewer 会话复审，最多 N 轮。评审提示词随严格契约附带 P0-P3 rubric（P0→critical、P1→high、P2→medium、P3→low；存在 P0/P1 即 FAIL）。轮次耗尽仍 FAIL 时返回完整逐轮证据链 `result.rework`；`maxReworkRounds=0` 与 v0.1 单轮行为完全一致。
-5. **`continue_task`**
+6. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
    - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000), `fromCheckpoint` (可选)。
    - **Checkpoint 续跑（P5）**：失败/被取消的后台任务与被看门狗终止的 stalled 任务会把输出尾部（≤32k 字符）溢出为一次性 checkpoint 工件（`<agentmeshHome>/checkpoints/`，记录 reason 与用量）。`fromCheckpoint` 消费该工件并把抢救内容注入本次续跑 prompt 头部；checkpoint 是**一次性消费令牌**——续跑提交前先落 consumed 墓碑（fail-closed），二次消费与未知 checkpointId 都会被结构化拒绝。codex 通道 SIGKILL 级崩溃的 finalAnswer 另由 rollout 文件 tail 抢救（T1.4 机制），两者互补。
-6. **`list_agents`**
+7. **`list_agents`**
    - 输出**路由表视图**（T4.2）：每个注册 Agent 一块——名称/别名/**实时可用性**（registry 扫描前置到本次调用）/传输模式/沙箱申报/**路由元数据**（`tier`、`costLevel`、`strengths`、`notGoodAt`、`notes`，来自 `.agentmesh/config.json` 的 `agents` 段；未配置显示 `unmetered` 而非报错）/**candidates 升级链视图**/最近能力诊断；`agents` 段中无法解析为二进制的档位变体（如 codex profile 档）单列展示。主模型读一次即可完成全部任务分配。
    - 参数：`cwd` (可选，用于定位最近的 `.agentmesh/config.json`，默认当前目录)。
-7. **`get_session`**
+8. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
-8. **`get_role_config`**
+9. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
    - 参数：`cwd` (可选，默认当前目录)。
-9. **`compact_context`**
-   - 把每个来源 Session 的规范化历史压缩为一份语义摘要 sidecar：用该 Session 绑定的 Agent 以 worker 角色发起一轮禁工具摘要任务（八段结构：原始意图/关键技术概念/涉及文件与数据/错误与修复/全部用户指令/待办/当前状态/下一步；先 `<analysis>` 草稿再 `<summary>` 交付，交付前剥除草稿），摘要 ≤2000 tokens（超长截断并显式标注），末尾固定一行指向完整原文的指针。
-   - 摘要写入源 Session 的 summary sidecar，**不改动其历史**；同一 Session 的并发 compact 调用会去重并返回进行中提示。
-   - 参数：`sourceSessionIds` (必填，1-4 个 Bridge Session ID)。
-10. **`run_workflow`**
+10. **`compact_context`**
+
+- 把每个来源 Session 的规范化历史压缩为一份语义摘要 sidecar：用该 Session 绑定的 Agent 以 worker 角色发起一轮禁工具摘要任务（八段结构：原始意图/关键技术概念/涉及文件与数据/错误与修复/全部用户指令/待办/当前状态/下一步；先 `<analysis>` 草稿再 `<summary>` 交付，交付前剥除草稿），摘要 ≤2000 tokens（超长截断并显式标注），末尾固定一行指向完整原文的指针。
+- 摘要写入源 Session 的 summary sidecar，**不改动其历史**；同一 Session 的并发 compact 调用会去重并返回进行中提示。
+- 参数：`sourceSessionIds` (必填，1-4 个 Bridge Session ID)。
+
+11. **`run_workflow`**
     - 把一份声明式 JSON spec 交给进程内**确定性编排状态机**（M4）执行：每个 stage 派发 agent（worker/reviewer/tester 角色或 `parallelGroups` 并行包），执行验收命令 + 必需文件检查；reviewer stage 的 FAIL 会把结构化 findings 注入原 worker 会话（`continue_task`）并复审，直到 PASS 或轮次耗尽。流转全程无 LLM 参与；stage 派发走与 `delegate_task(background:true)` 相同的后台任务路径（registry 持久化、stalled 看门狗、`cancel_task` 全部继承），等待全事件驱动。
     - 参数：`spec` (必填), `cwd` (可选，stage 派发与验收命令的目标目录)。spec：`name` + `stages[]`；每个 stage 声明 `roles` 或 `parallelGroups`（二选一）与 `dispatch`（`agent`、`mode`、`taskTemplate` 支持 `{{workflowName}}`/`{{stageName}}`/`{{group}}`/`{{upstreamSummaries}}` 占位符，`contextPolicy.contextSessionIds: "upstream"` 或显式数组 ≤4，`timeoutMs`），可选 `acceptance`（`commands[]` 顺序执行于 cwd，exit 0 = 通过；`files[]` 必须存在）与 `policy`（`maxReworkRounds` 0-3、`escalateOn: reviewFail|acceptanceFail|any`、`reRouteOnStall`，见下文"确定性编排状态机"）。
     - 终态：`done`（全部 stage 通过）/ `escalated`（命中 `escalateOn` 的失败类——快照携带完整证据链：逐轮 findings、验收命令输出、仓库 diff 摘要；这是唯一回到 LLM Orchestrator/人类的点）/ `failed`（其余失败）。调用立即异步返回 `{workflowId}`，用 `get_workflow` 观察。
-11. **`get_workflow`**
+12. **`get_workflow`**
     - 返回工作流当前快照：总体状态、逐 stage 状态迁移、派发任务记录（stage 任务 ID 形如 `<workflowId>_s<stage>_<seq>`，可被 `poll_task`/`cancel_task` 直接观察）、验收命令结果、逐轮评审 verdict 与 findings、终态完整证据链。
     - 参数：`workflowId` (必填), `maxWaitMs` (可选，0-60000 事件驱动长轮询，推荐 30000)。本进程持有的活跃工作流支持长轮询；其他（含已结束 bridge 进程启动的）工作流从持久化的 workflows.jsonl 日志读取最后一份快照（追加式 JSONL，损坏行跳过 fail-closed）。
-12. **`handoff_diff`**
+13. **`handoff_diff`**
     - 交接保真度的机器判定（v0.4 M7）：传入 `upstreamSessionId` 与 `downstreamSessionId`（均为 Bridge session id），对比上游会话实际产出（task、summary、finalAnswer、findings、仓库证据）与下游派发实际接收到的注入内容，返回损失等级——`lossless | minor-truncation | partial-loss | severe-loss | lost`——附逐节判定（`missingKeys`/`truncatedKeys`/`preservedSections`）与下游会话每次上下文注入的完整清单。
     - 判定优先使用逐字记录的注入内容（shared-context audit sidecar），不可读时降级为审计元数据；被分析注入的 STALE 新鲜度会把无损结果降级。用它替代人工比对会话历史来判断交接是否损失信息。
 

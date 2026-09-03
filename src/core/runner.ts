@@ -23,6 +23,7 @@ import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import { appendTaskMetrics } from "./metrics.js";
 import type { TaskMetricsOutcome } from "./metrics.js";
+import { readTaskQueuedDurationMs } from "./background.js";
 import {
   ModelHealthStore,
   orderCandidatesByHealth,
@@ -2400,6 +2401,10 @@ export class MultiAgentRunner {
             : result.status === "success"
               ? "ok"
               : "error";
+      // M7b: queued→started latency, read from the background task registry the
+      // dispatch service wrote its queue markers into. Undefined for immediate
+      // starts (never queued), so pre-M7b record shape is preserved.
+      const queuedMs = options.bgTaskId ? readTaskQueuedDurationMs(options.bgTaskId) : undefined;
       appendTaskMetrics(
         {
           taskId: options.bgTaskId,
@@ -2414,6 +2419,7 @@ export class MultiAgentRunner {
           stallEvents: 0,
           cancelEvents: outcome === "cancelled" ? 1 : 0,
           outcome,
+          ...(queuedMs !== undefined ? { queuedMs } : {}),
           startedAt: new Date(endedAtMs - durationMs).toISOString(),
           endedAt: new Date(endedAtMs).toISOString(),
         },

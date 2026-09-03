@@ -6,7 +6,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { startMcpServer } from "../../src/mcp/server.js";
-import { BackgroundDispatchService } from "../../src/mcp/tools.js";
+import {
+  BackgroundDispatchService,
+  resolveMaxConcurrentBackgroundTasks,
+} from "../../src/mcp/tools.js";
 import { BackgroundTaskRegistry } from "../../src/core/background.js";
 import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
@@ -44,8 +47,11 @@ class GatedAdapter extends BaseAdapter {
   readonly defaultExecutableName = "node";
 
   public gate: ReleaseGate = new ReleaseGate();
+  /** Tasks as received by the vendor boundary (checkpoint-injection assertions). */
+  public receivedTasks: string[] = [];
 
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+    this.receivedTasks.push(options.task);
     const outputFile = options.taskActivity?.outputFile;
     if (outputFile) fs.appendFileSync(outputFile, "started\n", "utf-8");
     await Promise.race([
@@ -272,5 +278,296 @@ describe("mcp background delegate and poll_task", () => {
     expect(background.activeCount).toBe(0);
     const stored = await registry.readStoredResult(taskId);
     expect(stored?.status).toBe("failed");
+  });
+
+  it("pauses a running task and resumes the SAME session via continue_task(fromCheckpoint)", async () => {
+    adapter.gate = new ReleaseGate();
+    const taskId = await startBackgroundTask();
+    await waitFor(() => fs.readFileSync(outputFilePathOf(taskId), "utf-8").includes("started\n"));
+
+    const pauseRes = await client.callTool({ name: "pause_task", arguments: { taskId } });
+    expect(pauseRes.isError).toBeFalsy();
+    const pauseOutcome = JSON.parse(
+      (pauseRes.content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as {
+      taskId: string;
+      status: string;
+      cancelReason: string;
+      checkpointId?: string;
+      result?: { status: string; sessionId?: string };
+    };
+    expect(pauseOutcome.taskId).toBe(taskId);
+    expect(pauseOutcome.status).toBe("cancelled");
+    expect(pauseOutcome.cancelReason).toBe("paused");
+    expect(pauseOutcome.result?.status).toBe("failed");
+    expect(pauseOutcome.result?.sessionId).toBeTruthy();
+    expect(pauseOutcome.checkpointId).toBeTruthy();
+
+    const stored = await registry.readStoredResult(taskId);
+    expect(stored?.status).toBe("failed");
+    expect(stored?.sessionId).toBe(pauseOutcome.result?.sessionId);
+
+    // Resume the paused work on the same Bridge session with the checkpoint baton.
+    adapter.gate.open();
+    const continueRes = await client.callTool({
+      name: "continue_task",
+      arguments: {
+        sessionId: pauseOutcome.result!.sessionId!,
+        task: "Resume and finish the paused work",
+        fromCheckpoint: pauseOutcome.checkpointId,
+      },
+    });
+    const continueText = (continueRes.content as Array<{ type: string; text: string }>)[0]!.text;
+    expect(continueRes.isError).toBeFalsy();
+    expect(continueText).toContain("Status: SUCCESS");
+    // The salvaged partial output was injected at the head of the continuation.
+    expect(adapter.receivedTasks[1]).toContain("Recovered Checkpoint");
+    expect(adapter.receivedTasks[1]).toContain("started");
+
+    // One-shot baton: a second resume attempt with the same checkpoint fails closed.
+    const replay = await client.callTool({
+      name: "continue_task",
+      arguments: {
+        sessionId: pauseOutcome.result!.sessionId!,
+        task: "Second resume attempt",
+        fromCheckpoint: pauseOutcome.checkpointId,
+      },
+    });
+    expect(replay.isError).toBe(true);
+    expect((replay.content as Array<{ type: string; text: string }>)[0]!.text).toContain(
+      "already consumed",
+    );
+  });
+
+  it("keeps priority/deps inert on synchronous dispatches (zero regression)", async () => {
+    adapter.gate.open();
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Quick sync job",
+        priority: 9,
+        deps: ["bgtask_ignored_on_sync"],
+      },
+    });
+    expect(res.isError).toBeFalsy();
+    expect((res.content as Array<{ type: string; text: string }>)[0]!.text).toContain(
+      "Status: SUCCESS",
+    );
+  });
+});
+
+describe("mcp background M7b queue (cap, deps, priority)", () => {
+  let client: Client;
+  let clientTransport: InMemoryTransport;
+  let serverTransport: InMemoryTransport;
+  let server: McpServer;
+  let adapter: GatedAdapter;
+  let runner: MultiAgentRunner;
+  let registry: BackgroundTaskRegistry;
+  let background: BackgroundDispatchService;
+  let homeDir: string;
+
+  beforeEach(async () => {
+    homeDir = path.join(
+      os.tmpdir(),
+      `agentmesh_mcp_queue_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    );
+    // The bridge-level cap is an env property read at service construction.
+    process.env.AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS = "1";
+    const appRegistry = new AgentRegistry();
+    const sessionManager = new SessionManager({ persist: false });
+    adapter = new GatedAdapter();
+    appRegistry.register(adapter);
+    runner = new MultiAgentRunner(appRegistry, sessionManager);
+    registry = new BackgroundTaskRegistry({ homeDir });
+    background = new BackgroundDispatchService(registry);
+
+    [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    server = await startMcpServer({
+      runner,
+      backgroundService: background,
+      transport: serverTransport,
+    });
+    client = new Client({ name: "test-client", version: "1.0.0" }, { capabilities: {} });
+    await client.connect(clientTransport);
+  });
+
+  afterEach(async () => {
+    delete process.env.AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS;
+    try {
+      await clientTransport.close();
+      await serverTransport.close();
+      await server.close();
+    } catch {
+      // ignore
+    }
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  const waitFor = async (condition: () => boolean, timeoutMs = 5000): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error("waitFor timed out");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+
+  const outputFilePathOf = (taskId: string): string =>
+    registry.getRegisteredTask(taskId)?.outputFile ??
+    path.join(homeDir, "tasks", `${taskId}.output`);
+
+  const dispatchBackground = async (
+    extraArgs: Record<string, unknown>,
+  ): Promise<{ taskId: string; text: string }> => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Queued job",
+        role: "worker",
+        background: true,
+        ...extraArgs,
+      },
+    });
+    const text = (res.content as Array<{ type: string; text: string }>)[0]!.text;
+    const match = text.match(/Task ID: (\S+)/);
+    expect(match).not.toBeNull();
+    return { taskId: match![1]!, text };
+  };
+
+  const pollJson = async (taskId: string): Promise<Record<string, unknown>> => {
+    const res = await client.callTool({ name: "poll_task", arguments: { taskId } });
+    return JSON.parse((res.content as Array<{ type: string; text: string }>)[0]!.text) as Record<
+      string,
+      unknown
+    >;
+  };
+
+  it("reports queued/blocked with queuePosition and blockedBy until the dependency completes", async () => {
+    const dep = await dispatchBackground({});
+    await waitFor(() =>
+      fs.readFileSync(outputFilePathOf(dep.taskId), "utf-8").includes("started\n"),
+    );
+
+    const child = await dispatchBackground({ deps: [dep.taskId] });
+    expect(child.text).toContain("Status: QUEUED (blocked by deps:");
+    expect(child.text).toContain(dep.taskId);
+
+    const blocked = await pollJson(child.taskId);
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.blockedBy).toEqual([dep.taskId]);
+    expect(blocked.queuePosition).toBe(1);
+
+    adapter.gate.open();
+    // Two sequential runner dispatches (dep → child) under the Windows per-call
+    // runner overhead documented in vitest.config.ts.
+    await waitFor(
+      () => registry.readStoredResultSync(child.taskId)?.status === "completed",
+      10_000,
+    );
+    const finalOutcome = (await pollJson(child.taskId)) as {
+      status: string;
+      result?: { summary?: string };
+    };
+    expect(finalOutcome.status).toBe("completed");
+    expect(finalOutcome.result?.summary).toBe("Background finished");
+  });
+
+  it("runs queued dispatches in priority order as slots free up", async () => {
+    const first = await dispatchBackground({});
+    const low = await dispatchBackground({ priority: 5 });
+    const high = await dispatchBackground({ priority: 0 });
+
+    expect(first.text).toContain("Status: RUNNING");
+    expect(low.text).toContain("Status: QUEUED (waiting for a free concurrency slot)");
+    expect(high.text).toContain("Status: QUEUED (waiting for a free concurrency slot)");
+
+    const lowQueued = await pollJson(low.taskId);
+    expect(lowQueued.status).toBe("queued");
+    const highQueued = await pollJson(high.taskId);
+    expect(highQueued.status).toBe("queued");
+    // Priority 0 outranks priority 5 regardless of enqueue order.
+    expect(highQueued.queuePosition).toBeLessThan(lowQueued.queuePosition as number);
+
+    adapter.gate.open();
+    // Three sequential runner dispatches (first → high → low), each paying the
+    // Windows per-call runner overhead documented in vitest.config.ts, so the
+    // chain needs a larger budget than the 5s waitFor default.
+    await waitFor(
+      () =>
+        registry.readStoredResultSync(first.taskId)?.status === "completed" &&
+        registry.readStoredResultSync(high.taskId)?.status === "completed" &&
+        registry.readStoredResultSync(low.taskId)?.status === "completed",
+      15_000,
+    );
+  });
+
+  it("fails a dispatch immediately with DEP_FAILED when its dependency already failed", async () => {
+    // The gated adapter only fails on abort; drive a failing dep through a
+    // client-cancel of the background task instead.
+    const dep = await dispatchBackground({});
+    await waitFor(() =>
+      fs.readFileSync(outputFilePathOf(dep.taskId), "utf-8").includes("started\n"),
+    );
+    const cancelRes = await client.callTool({
+      name: "cancel_task",
+      arguments: { taskId: dep.taskId, reason: "dep poisoned" },
+    });
+    const cancelOutcome = JSON.parse(
+      (cancelRes.content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as { status: string };
+    expect(cancelOutcome.status).toBe("cancelled");
+
+    const child = await dispatchBackground({ deps: [dep.taskId] });
+    expect(child.text).toContain("Status: FAILED (DEP_FAILED");
+    expect(child.text).toContain(dep.taskId);
+    const outcome = await pollJson(child.taskId);
+    expect(outcome.status).toBe("failed");
+    expect(JSON.stringify(outcome.result)).toContain("DEP_FAILED");
+  });
+
+  it("rejects unknown deps with a structured DEP_UNKNOWN error and no task record", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Orphan dependency",
+        background: true,
+        deps: ["bgtask_never_dispatched"],
+      },
+    });
+    expect(res.isError).toBe(true);
+    const payload = JSON.parse((res.content as Array<{ type: string; text: string }>)[0]!.text) as {
+      error: string;
+      taskId: string;
+      invalidDeps: string[];
+    };
+    expect(payload.error).toBe("DEP_UNKNOWN");
+    expect(payload.invalidDeps).toEqual(["bgtask_never_dispatched"]);
+    // No orphan registration line was persisted for the rejected dispatch —
+    // in this test NO dispatch was ever accepted, so the registry file itself
+    // must not even exist.
+    const registryPath = registry.registryFilePath;
+    expect(
+      !fs.existsSync(registryPath) ||
+        !fs.readFileSync(registryPath, "utf-8").includes("bgtask_never_dispatched"),
+    ).toBe(true);
+  });
+
+  it("resolves the bridge cap from AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS", () => {
+    expect(
+      resolveMaxConcurrentBackgroundTasks({ AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS: "3" }),
+    ).toBe(3);
+    expect(resolveMaxConcurrentBackgroundTasks({})).toBeUndefined();
+    expect(
+      resolveMaxConcurrentBackgroundTasks({ AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS: "  " }),
+    ).toBeUndefined();
+    expect(
+      resolveMaxConcurrentBackgroundTasks({ AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS: "zero" }),
+    ).toBeUndefined();
+    expect(
+      resolveMaxConcurrentBackgroundTasks({ AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS: "0" }),
+    ).toBeUndefined();
   });
 });

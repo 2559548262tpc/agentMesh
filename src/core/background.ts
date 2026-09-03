@@ -79,6 +79,22 @@ export interface BackgroundTaskRecord {
    * Orphaned records are pruned by age/count on subsequent scans.
    */
   orphanedAtMs?: number;
+  /**
+   * M7b queue marker: present only while the dispatch is registered but held
+   * out of execution (concurrency cap reached or dependencies unmet). The
+   * persisted marker is what lets a restarted bridge re-derive the queue
+   * state from registry.jsonl; it is cleared when the task starts or leaves
+   * the queue (cancel / DEP_FAILED).
+   */
+  state?: "queued";
+  /** Queue ordering key (lower runs first). Only meaningful while queued. */
+  priority?: number;
+  /** Instant the dispatch entered the queue (epoch ms); the tiebreaker after priority. */
+  enqueuedAtMs?: number;
+  /** Task ids that must reach terminal SUCCESS before this dispatch may start. */
+  deps?: string[];
+  /** Actual execution start instant (epoch ms); differs from startedAtMs when queued first. */
+  dispatchedAtMs?: number;
 }
 
 /** Terminal outcome written by the completion callback to <taskId>.result.json. */
@@ -89,10 +105,24 @@ export interface StoredTaskResult {
   finalAnswer?: string;
   error?: string;
   exitCode?: number;
+  /**
+   * M7b pause/resume handle: the Bridge session that executed the dispatch,
+   * persisted so pause_task/continue_task can resume the same session without
+   * the orchestrator bookkeeping the mapping itself. Absent for dispatches
+   * that never reached a vendor turn (queued-cancelled, DEP_FAILED).
+   */
+  sessionId?: string;
   completedAtMs: number;
 }
 
-export type PollTaskStatus = "running" | "completed" | "failed" | "stalled" | "interrupted";
+export type PollTaskStatus =
+  | "running"
+  | "queued"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "stalled"
+  | "interrupted";
 
 export interface PollTaskOutcome {
   taskId: string;
@@ -109,6 +139,13 @@ export interface PollTaskOutcome {
   interruptedAtMs?: number;
   /** Re-dispatch guidance accompanying an interrupted status. */
   guidance?: string;
+  /**
+   * M7b: 1-based rank among the bridge's queued (not-yet-started) dispatches,
+   * ordered by (priority, enqueue time). Present only while queued/blocked.
+   */
+  queuePosition?: number;
+  /** M7b: dep ids that have not reached terminal SUCCESS yet (status "blocked"). */
+  blockedBy?: string[];
 }
 
 export interface PollTaskOptions {
@@ -243,6 +280,18 @@ function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
       ...(typeof candidate.orphanedAtMs === "number"
         ? { orphanedAtMs: candidate.orphanedAtMs }
         : {}),
+      // M7b queue fields; old registry lines predate them.
+      ...(candidate.state === "queued" ? { state: "queued" as const } : {}),
+      ...(typeof candidate.priority === "number" ? { priority: candidate.priority } : {}),
+      ...(typeof candidate.enqueuedAtMs === "number"
+        ? { enqueuedAtMs: candidate.enqueuedAtMs }
+        : {}),
+      ...(Array.isArray(candidate.deps)
+        ? { deps: candidate.deps.filter((dep): dep is string => typeof dep === "string") }
+        : {}),
+      ...(typeof candidate.dispatchedAtMs === "number"
+        ? { dispatchedAtMs: candidate.dispatchedAtMs }
+        : {}),
     };
   } catch {
     return undefined;
@@ -251,6 +300,62 @@ function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Narrows one parsed result-file document into a StoredTaskResult. Returns
+ * undefined for malformed input; a corrupt result file is treated as absent
+ * (liveness decides instead), never fatal.
+ */
+function parseStoredResult(parsed: unknown): StoredTaskResult | undefined {
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const candidate = parsed as Record<string, unknown>;
+  if (
+    typeof candidate.taskId !== "string" ||
+    (candidate.status !== "completed" && candidate.status !== "failed") ||
+    typeof candidate.completedAtMs !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    taskId: candidate.taskId,
+    status: candidate.status,
+    summary: typeof candidate.summary === "string" ? candidate.summary : undefined,
+    finalAnswer: typeof candidate.finalAnswer === "string" ? candidate.finalAnswer : undefined,
+    error: typeof candidate.error === "string" ? candidate.error : undefined,
+    exitCode: typeof candidate.exitCode === "number" ? candidate.exitCode : undefined,
+    sessionId: typeof candidate.sessionId === "string" ? candidate.sessionId : undefined,
+    completedAtMs: candidate.completedAtMs,
+  };
+}
+
+/** M7b queue order: priority ascending (lower runs first), then enqueue instant. */
+function compareQueueOrder(a: BackgroundTaskRecord, b: BackgroundTaskRecord): number {
+  const priorityDelta = (a.priority ?? 0) - (b.priority ?? 0);
+  if (priorityDelta !== 0) return priorityDelta;
+  return (a.enqueuedAtMs ?? a.startedAtMs) - (b.enqueuedAtMs ?? b.startedAtMs);
+}
+
+/**
+ * M7b metrics seam: queued→started latency for a background dispatch that
+ * waited in the concurrency/dependency queue. Defined only when the record
+ * carries both the enqueue and the actual dispatch instants (immediate starts
+ * never queue, so they report undefined and the metrics record stays as
+ * before). Reads the latest persisted registry record for the taskId.
+ */
+export function readTaskQueuedDurationMs(
+  taskId: string,
+  options: { homeDir?: string } = {},
+): number | undefined {
+  const homeDir = options.homeDir ?? resolveAgentMeshHome();
+  const registryFile = taskRegistryFilePath(homeDir);
+  let latest: BackgroundTaskRecord | undefined;
+  for (const record of defaultStorage.readJsonLines(registryFile, parseRegistryLine)) {
+    if (record.taskId === taskId) latest = record;
+  }
+  const { enqueuedAtMs, dispatchedAtMs } = latest ?? {};
+  if (enqueuedAtMs === undefined || dispatchedAtMs === undefined) return undefined;
+  return Math.max(0, dispatchedAtMs - enqueuedAtMs);
+}
 
 export interface StalledWatchdogOptions {
   /**
@@ -380,6 +485,115 @@ export class BackgroundTaskRegistry {
     return defaultStorage.readJsonLines(this.registryFile, parseRegistryLine);
   }
 
+  /**
+   * M7b queue bookkeeping: a queue-state transition updates the owning record
+   * in memory and re-publishes registry.jsonl (deduped, last record per taskId
+   * wins) so a restarted bridge re-derives the queue from disk. The rewrite is
+   * synchronous on purpose: transitions run inside the single-threaded
+   * dispatch decision path, so no interleaved registration append can be
+   * lost between the read and the publish.
+   */
+  private rewriteRecord(
+    taskId: string,
+    mutate: (record: BackgroundTaskRecord) => BackgroundTaskRecord,
+  ): BackgroundTaskRecord | undefined {
+    const inActive = this.active.get(taskId);
+    const current =
+      inActive ??
+      [...this.readPersistedRecords()].reverse().find((record) => record.taskId === taskId);
+    if (!current) return undefined;
+    const updated = mutate({ ...current });
+    if (inActive) this.active.set(taskId, updated);
+    const deduped = new Map<string, BackgroundTaskRecord>();
+    for (const record of this.readPersistedRecords()) deduped.set(record.taskId, record);
+    deduped.set(taskId, updated);
+    const records = [...deduped.values()];
+    defaultStorage.writeFileAtomicSync(
+      this.registryFile,
+      records.map((record) => JSON.stringify(record)).join("\n") + (records.length > 0 ? "\n" : ""),
+      { store: "tasks" },
+    );
+    return updated;
+  }
+
+  /** Marks a registered dispatch as queued (persists the queue marker). */
+  public markTaskQueued(
+    taskId: string,
+    meta: { priority?: number; deps?: string[]; enqueuedAtMs: number },
+  ): void {
+    this.rewriteRecord(taskId, (record) => ({
+      ...record,
+      state: "queued",
+      enqueuedAtMs: meta.enqueuedAtMs,
+      ...(meta.priority !== undefined ? { priority: meta.priority } : {}),
+      ...(meta.deps !== undefined ? { deps: [...meta.deps] } : {}),
+    }));
+  }
+
+  /**
+   * Marks a queued dispatch as started: clears the queue marker, stamps the
+   * actual execution start, and (for queued→running transitions only) emits a
+   * genuine task.started event so long-pollers blocked on a queued task wake.
+   * Immediate-start dispatches already emitted task.started at registration
+   * and are deliberately not re-announced.
+   */
+  public markTaskStarted(taskId: string): void {
+    const wasQueued = this.getRegisteredTask(taskId)?.state === "queued";
+    const updated = this.rewriteRecord(taskId, (record) => ({
+      ...record,
+      state: undefined,
+      dispatchedAtMs: this.now(),
+    }));
+    if (wasQueued && updated) {
+      this._eventBus?.emit({
+        type: "task.started",
+        taskId,
+        outputFile: updated.outputFile,
+        startedAtMs: updated.dispatchedAtMs ?? updated.startedAtMs,
+      });
+    }
+  }
+
+  /** Clears the queue marker when a task leaves the queue without starting (cancel / DEP_FAILED). */
+  public markTaskDequeued(taskId: string): void {
+    this.rewriteRecord(taskId, (record) => ({ ...record, state: undefined }));
+  }
+
+  /**
+   * Queue view for one task: membership (queued = runnable, blocked = unmet
+   * dependencies), its 1-based position, and the dep ids that have not reached
+   * terminal SUCCESS yet. Returns undefined for tasks that are not queued.
+   */
+  public async getQueueStatus(
+    taskId: string,
+  ): Promise<{ state: "queued" | "blocked"; position: number; blockedBy: string[] } | undefined> {
+    const queued = this.listQueuedRecords();
+    const index = queued.findIndex((record) => record.taskId === taskId);
+    if (index < 0) return undefined;
+    const blockedBy: string[] = [];
+    for (const dep of queued[index]!.deps ?? []) {
+      const depResult = await this.readStoredResult(dep);
+      if (!depResult || depResult.status !== "completed") blockedBy.push(dep);
+    }
+    return {
+      state: blockedBy.length > 0 ? "blocked" : "queued",
+      position: index + 1,
+      blockedBy,
+    };
+  }
+
+  /** Every record currently marked queued (own active map + persisted restart view), in run order. */
+  private listQueuedRecords(): BackgroundTaskRecord[] {
+    const queued = new Map<string, BackgroundTaskRecord>();
+    for (const record of this.readPersistedRecords()) {
+      if (record.state === "queued") queued.set(record.taskId, record);
+    }
+    for (const record of this.active.values()) {
+      if (record.state === "queued") queued.set(record.taskId, record);
+    }
+    return [...queued.values()].sort(compareQueueOrder);
+  }
+
   public async readStoredResult(taskId: string): Promise<StoredTaskResult | undefined> {
     let raw: string | undefined;
     try {
@@ -389,29 +603,39 @@ export class BackgroundTaskRegistry {
     }
     if (raw === undefined) return undefined;
     try {
-      const parsed: unknown = JSON.parse(raw);
-      if (typeof parsed !== "object" || parsed === null) return undefined;
-      const candidate = parsed as Record<string, unknown>;
-      if (
-        typeof candidate.taskId !== "string" ||
-        (candidate.status !== "completed" && candidate.status !== "failed") ||
-        typeof candidate.completedAtMs !== "number"
-      ) {
-        return undefined;
-      }
-      return {
-        taskId: candidate.taskId,
-        status: candidate.status,
-        summary: typeof candidate.summary === "string" ? candidate.summary : undefined,
-        finalAnswer: typeof candidate.finalAnswer === "string" ? candidate.finalAnswer : undefined,
-        error: typeof candidate.error === "string" ? candidate.error : undefined,
-        exitCode: typeof candidate.exitCode === "number" ? candidate.exitCode : undefined,
-        completedAtMs: candidate.completedAtMs,
-      };
+      return parseStoredResult(JSON.parse(raw));
     } catch {
       // A half-written result file is treated as absent; liveness decides instead.
       return undefined;
     }
+  }
+
+  /**
+   * Synchronous twin of readStoredResult for the M7b dispatch-decision path:
+   * dependency ruling and queued-cancel recording run inside the single-threaded
+   * launch/cancel decision and must observe the terminal state without an
+   * interleaving await.
+   */
+  public readStoredResultSync(taskId: string): StoredTaskResult | undefined {
+    return parseStoredResult(defaultStorage.readJson(this.resultFilePath(taskId)));
+  }
+
+  /**
+   * Synchronous twin of writeStoredResult for the same decision path: the
+   * DEP_FAILED and queued-cancel outcomes must be durably visible before the
+   * launch/cancel call returns, so a poll_task issued right after can never
+   * observe a stale "running" window.
+   */
+  public writeStoredResultSync(result: StoredTaskResult): void {
+    defaultStorage.writeFileAtomicSync(this.resultFilePath(result.taskId), JSON.stringify(result), {
+      store: "tasks",
+    });
+    this._eventBus?.emit({
+      type: "task.completed",
+      taskId: result.taskId,
+      status: result.status,
+      exitCode: result.exitCode,
+    });
   }
 
   /** Completion callback target: persists the terminal outcome atomically enough for readers. */
@@ -567,6 +791,9 @@ export class BackgroundTaskRegistry {
     for (const [taskId, record] of this.active) {
       if (this.terminatedNotified.has(taskId)) continue;
       if (defaultStorage.exists(this.resultFilePath(taskId))) continue;
+      // Queued dispatches produce no output by definition (no vendor process
+      // has been started); stall detection must not flag them.
+      if (record.state === "queued") continue;
       const handle = this.watchdogConfig?.getActivityHandle?.(taskId);
       const lastOutputAtMs = handle?.getLastOutputAtMs() ?? record.startedAtMs;
       const silence = nowMs - lastOutputAtMs;
@@ -719,6 +946,26 @@ export class BackgroundTaskRegistry {
       status = stored.status;
     } else if (this.isStallNotified(taskId)) {
       status = "stalled";
+    } else if (
+      record.state === "queued" &&
+      (record.pid === process.pid || this.pidAlive(record.pid))
+    ) {
+      // M7b: registered but deliberately held out of execution (concurrency cap
+      // or unmet dependencies). A dead owner falls through to the liveness
+      // ruling below — the next startup scan dead-letters it as interrupted.
+      const queueStatus = await this.getQueueStatus(taskId);
+      if (queueStatus) {
+        return {
+          taskId,
+          status: queueStatus.state,
+          outputSinceOffset: read.content,
+          nextOffset: read.nextOffset,
+          hasMore: read.hasMore,
+          queuePosition: queueStatus.position,
+          ...(queueStatus.blockedBy.length > 0 ? { blockedBy: queueStatus.blockedBy } : {}),
+        };
+      }
+      status = "running";
     } else if (this.active.has(taskId)) {
       status = "running";
     } else {
@@ -741,6 +988,8 @@ export class BackgroundTaskRegistry {
    * (default 100ms/500ms); with one, the wait is event-driven — a single
    * sleep of the remaining budget only serves as the deadline guard, so a
    * long maxWaitMs call blocks until activity instead of re-polling.
+   * Queued/blocked dispatches (M7b) also keep the call waiting: the
+   * queued→running transition emits a task.started event that wakes the poll.
    */
   public async pollTask(options: PollTaskOptions): Promise<PollTaskOutcome> {
     const intervalMs = options.intervalMs ?? POLL_INTERVAL_MS;
@@ -750,7 +999,12 @@ export class BackgroundTaskRegistry {
     // clock drives status decisions and must never stretch a caller's poll.
     const deadline = Date.now() + maxWaitMs;
     let outcome = await this.pollOnce(options.taskId, options.sinceOffset ?? 0);
-    while (outcome.status === "running" && Date.now() < deadline) {
+    while (
+      (outcome.status === "running" ||
+        outcome.status === "queued" ||
+        outcome.status === "blocked") &&
+      Date.now() < deadline
+    ) {
       if (options.waitForActivity) {
         // Event-driven wake: the remaining budget is the losing race member,
         // so a never-firing hook cannot stretch the caller's poll.

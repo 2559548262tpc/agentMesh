@@ -35,6 +35,12 @@ export interface TaskMetrics {
   stallEvents: number;
   cancelEvents: number;
   outcome: TaskMetricsOutcome;
+  /**
+   * M7b queued→started latency in ms; present only when the dispatch waited in
+   * the background queue (concurrency cap or unmet deps). Immediate starts leave
+   * it absent so pre-M7b records stay byte-compatible.
+   */
+  queuedMs?: number;
   /** ISO timestamps; `startedAt` is derived from endedAt - durationMs. */
   startedAt: string;
   endedAt: string;
@@ -156,6 +162,12 @@ function parseTaskMetricsLine(line: string): TaskMetrics | undefined {
       stallEvents: nonNegativeNumber(candidate.stallEvents),
       cancelEvents: nonNegativeNumber(candidate.cancelEvents),
       outcome,
+      // M7b: absent on immediate-start records — never fabricated as 0.
+      ...(typeof candidate.queuedMs === "number" &&
+      Number.isFinite(candidate.queuedMs) &&
+      candidate.queuedMs >= 0
+        ? { queuedMs: candidate.queuedMs }
+        : {}),
       startedAt,
       endedAt,
     };
