@@ -70,4 +70,37 @@ describe("core/repository evidence", () => {
       fs.rmSync(plainDirectory, { recursive: true, force: true });
     }
   });
+
+  // P-076: `.agentmesh/` is bridge-owned runtime metadata, not repository
+  // content — rewriting it (config updates, capability probes) must not flip
+  // handoff freshness to STALE, surface in changedPaths, or set dirty.
+  it("excludes .agentmesh runtime metadata from fingerprints and dirty state", async () => {
+    const before = await captureRepositoryState(repositoryRoot);
+
+    fs.mkdirSync(path.join(repositoryRoot, ".agentmesh"), { recursive: true });
+    fs.writeFileSync(
+      path.join(repositoryRoot, ".agentmesh", "config.json"),
+      JSON.stringify({ version: 1, touched: Date.now() }),
+    );
+    fs.writeFileSync(path.join(repositoryRoot, ".agentmesh", "capabilities.json"), "{}");
+
+    const after = await captureRepositoryState(repositoryRoot);
+
+    expect(after?.fingerprint).toBe(before?.fingerprint);
+    expect(after?.dirty).toBe(before?.dirty);
+    expect(after?.changedPaths).not.toContain(".agentmesh/config.json");
+    expect(after?.pathFingerprints?.[".agentmesh/config.json"]).toBeUndefined();
+  });
+
+  it("still reports business changes alongside .agentmesh metadata", async () => {
+    fs.mkdirSync(path.join(repositoryRoot, ".agentmesh"), { recursive: true });
+    fs.writeFileSync(path.join(repositoryRoot, ".agentmesh", "config.json"), "{}");
+    fs.writeFileSync(path.join(repositoryRoot, "feature.txt"), "business change\n");
+
+    const state = await captureRepositoryState(repositoryRoot);
+
+    expect(state?.dirty).toBe(true);
+    expect(state?.changedPaths).toContain("feature.txt");
+    expect(state?.changedPaths).not.toContain(".agentmesh/config.json");
+  });
 });

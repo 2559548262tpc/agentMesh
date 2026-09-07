@@ -1564,6 +1564,7 @@ export class MultiAgentRunner {
         break;
       }
       roundsRun += 1;
+      const fixBefore = await captureRepositoryState(params.cwd ?? process.cwd());
       const fixResult = await this.continueTask({
         sessionId: workerSessionId,
         task: buildReworkFixPrompt({
@@ -1580,10 +1581,25 @@ export class MultiAgentRunner {
         reviewOutcome: "UNKNOWN",
       });
       if (fixResult.status !== "success") {
-        reworkNote = `Rework round ${roundsRun} aborted: the worker fix turn failed (${
-          fixResult.error || fixResult.summary
-        }).`;
-        break;
+        // P-077: a failed fix turn may still have landed the fix — the vendor
+        // can die mid-turn (exit 1 / UnknownError) after writing files. When
+        // the business working tree changed during the turn, re-review the
+        // landed change instead of abandoning the loop: the reviewer, not the
+        // exit status, is the authority on whether findings were resolved.
+        const fixAfter = await captureRepositoryState(params.cwd ?? process.cwd());
+        const treeChangedDuringFix =
+          fixBefore && fixAfter && fixBefore.fingerprint !== fixAfter.fingerprint;
+        if (treeChangedDuringFix) {
+          reworkNote =
+            `Rework round ${roundsRun}: the worker fix turn reported a failure ` +
+            `(${fixResult.error || fixResult.summary}) but the working tree changed during ` +
+            `the turn; re-reviewing the landed change instead of abandoning the loop.`;
+        } else {
+          reworkNote = `Rework round ${roundsRun} aborted: the worker fix turn failed (${
+            fixResult.error || fixResult.summary
+          }).`;
+          break;
+        }
       }
 
       const reReview = await reviewOnce(

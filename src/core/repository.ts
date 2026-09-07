@@ -53,6 +53,40 @@ function parsePorcelainEntries(output: string): ChangedPathEntry[] {
   return changedPaths;
 }
 
+/**
+ * AgentMesh runtime metadata (`.agentmesh/`) is bridge-owned state, not
+ * repository content — the same exclusion the reviewer tree guard has applied
+ * since P-073. Including it in the working-tree fingerprint made every bridge
+ * dispatch that rewrites its own config invalidate downstream handoff
+ * freshness (STALE noise, P-076), so repository evidence now reflects the
+ * business working tree only.
+ */
+export function isBridgeMetadataPath(relativePath: string): boolean {
+  return relativePath === ".agentmesh" || relativePath.startsWith(".agentmesh/");
+}
+
+/**
+ * Drops porcelain entries whose (new) path is bridge metadata, returning the
+ * filtered NUL-separated text. Rename/copy source paths trailing their main
+ * entry are dropped together so the text stays well-formed for
+ * parsePorcelainEntries and stable as a fingerprint hash input.
+ */
+function filterBridgeMetadataFromPorcelain(output: string): string {
+  const parts = output.split("\0");
+  const kept: string[] = [];
+  for (let index = 0; index < parts.length; index++) {
+    const entry = parts[index];
+    if (!entry) continue;
+    if (entry.length >= 4 && isBridgeMetadataPath(entry.slice(3))) {
+      const status = entry.slice(0, 2);
+      if ((status.includes("R") || status.includes("C")) && parts[index + 1]) index++;
+      continue;
+    }
+    kept.push(entry);
+  }
+  return kept.join("\0");
+}
+
 async function fingerprintChangedPath(
   root: string,
   entry: ChangedPathEntry,
@@ -106,7 +140,8 @@ export async function captureRepositoryState(
     }
 
     const head = headResult.exitCode === 0 ? headResult.stdout.trim() : undefined;
-    const changedEntries = parsePorcelainEntries(statusResult.stdout);
+    const statusOutput = filterBridgeMetadataFromPorcelain(statusResult.stdout);
+    const changedEntries = parsePorcelainEntries(statusOutput);
     const changedPaths = [...new Set(changedEntries.map((entry) => entry.path))].slice(0, 100);
     const fingerprintEntries =
       changedEntries.length <= MAX_FINGERPRINTED_PATHS ? changedEntries : undefined;
@@ -115,9 +150,12 @@ export async function captureRepositoryState(
       const fingerprint = await fingerprintChangedPath(root, entry);
       if (fingerprint) pathFingerprints[entry.path] = fingerprint;
     }
-    const untrackedPaths = untrackedResult.stdout.split("\0").filter(Boolean).sort();
+    const untrackedPaths = untrackedResult.stdout
+      .split("\0")
+      .filter((entry) => Boolean(entry) && !isBridgeMetadataPath(entry))
+      .sort();
     const hash = crypto.createHash("sha256");
-    hash.update(`head\0${head || "unborn"}\0status\0${statusResult.stdout}`);
+    hash.update(`head\0${head || "unborn"}\0status\0${statusOutput}`);
     hash.update(`\0tracked\0${trackedDiffResult.stdout}\0staged\0${stagedDiffResult.stdout}`);
 
     for (const [index, relativePath] of untrackedPaths.entries()) {
@@ -148,7 +186,7 @@ export async function captureRepositoryState(
       capturedAt: new Date().toISOString(),
       repositoryRoot: root,
       head,
-      dirty: statusResult.stdout.length > 0,
+      dirty: statusOutput.length > 0,
       fingerprint: hash.digest("hex"),
       changedPaths,
       pathFingerprints: fingerprintEntries ? pathFingerprints : undefined,

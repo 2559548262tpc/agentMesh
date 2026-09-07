@@ -744,3 +744,63 @@
 **解决方法**：① 长轮询用例 `maxWaitMs` 降至 15_000（仍远大于 300ms gate 延迟，"单次调用阻塞直至终态"的断言不变），消除预算倒挂；② 环境性饥饿不加全局超时掩盖——复现时以"重跑单文件/受影响套件"判定，连续同一用例失败才视为回归。
 
 **状态**：已修复预算倒挂（2026-09-02）；环境饥饿为已知非缺陷，满载下偶发超时重跑即可，连续失败才立案。
+
+## P-075 评审简报含命令执行诱导即触发 opencode vendor 卡死 exit 124（v0.4 真实压测 T7 三连复现）
+
+**问题**：`review_changes`（background）简报中出现"验收脚本 src/slugify_check.mjs 必须通过"这类可执行命令指涉时，opencode 评审进程执行到命令调用处即停滞直至外部 timeout 击杀（exit 124）：nemotron-3.5-lightning-free 两次（timeoutMs 600s）+ mimo-v2.5-free 一次（timeoutMs 300s）完全同点复现；watchdog 正确记 stall 事件，但三次评审全部零产出。将简报改为"严格禁止运行任何命令，只读源码与 git diff 判断"后，同模型同任务一次通过并给出完整 FAIL 裁决。
+
+**根因**：opencode 评审通道对命令类工具调用的处理在非交互后台形态下会停滞（与 P-072 plan agent 夭折同源、形态不同：现在是 `--auto` 下命令执行挂起而非会话夭折）；M3 的 review prompt 契约未把"评审只读、禁止命令执行"固化为强制规则，简报措辞即可绕过。
+
+**解决方法**：短期：评审简报显式写明"只读评审，禁止运行任何命令"（本次实测有效）。长期：在 buildRolePrompt 的 reviewer 契约中固化"NEVER execute commands; inspect source and git diff only"硬规则，并在 runner 侧对评审任务的简报做命令指涉检测告警。
+
+**状态**：已修复（2026-09-03）——buildRolePrompt 的 reviewer 契约已固化 STRICT READ-ONLY RULE（禁止运行测试命令/包管理器，只允许 git diff/status/log 与读文件）及 WORKSPACE CLEANLINESS 规则（禁止在仓库内创建任何文件），prompts.test.ts 回归覆盖；runner 侧简报命令指涉检测告警未实现，后续可选加固。
+
+## P-076 repository fingerprint 将 .agentmesh/ 运行时文件计入导致 handoff freshness STALE 误报（v0.4 真实压测 T6）
+
+**问题**：T6 交接保真测试中，下游仅凭注入上下文回答 3/3 全对、handoff_diff content 侧 task/summary/finalAnswer/evidence 全部逐字保留（无截断无缺失），但 grade 仍被降级为 minor-truncation——唯一原因是注入块 freshness=STALE。lab 仓库实际代码未变，STALE 来自 `.agentmesh/config.json`（无 .gitignore 排除、处于 modified 状态）被 captureRepositoryState 的 `git status --untracked-files=all` 采集，AgentMesh 自身运行时写配置（健康度、capabilities 探测等）即改变 fingerprint。
+
+**根因**：`src/core/repository.ts` captureRepositoryState 对全树指纹采集，仅 P-073 的评审树守卫做了 `.agentmesh/` 默认排除，fingerprint 通道未同步该排除规则——两处对"仓库内容"的定义不一致。
+
+**解决方法**：captureRepositoryState 在解析 porcelain/untracked 条目时排除 `.agentmesh/` 前缀路径（与 P-073 的守卫排除规则对齐），使 freshness 只反映真实仓库内容变化。
+
+**状态**：已修复（2026-09-03）——captureRepositoryState 的 porcelain/untracked 通道统一排除 `.agentmesh/` 路径（isBridgeMetadataPath），fingerprint/dirty/pathFingerprints 只反映业务工作树；repository.test.ts 回归覆盖。注意：runner 评审树守卫的 P-R21-4 排除警告因此不再触发（证据层已过滤，守卫看不到 .agentmesh/ 变化），对应 runner.test.ts 断言已同步更新。
+
+## P-077 rework worker turn vendor 失败无重试导致 bounded rework 闭环断裂且 confirmed 信号永久丢失（v0.4 真实压测 T7）
+
+**问题**：T7 中 review FAIL（3 findings 正确落盘）后自动 rework 正常触发：findings 完整注入 worker 会话（"REWORK ROUND 1 OF 3"含全部 finding/suggestion/DoD），worker 在 354s 内完成修复落盘（slugify.mjs 改码 + 新建 CONTRACT.md），但该 vendor turn 以 exit 1/summary=UnknownError/0 字节输出终态，rework 闭环即告断裂：整个 review 任务终态 failed，无第 2 轮注入，无复审。事后人工重派独立复审 PASS，但 findings.jsonl 中 confirmed 全为空，`stats --findings` precision 0/4=0.0%——confirmed 补记无通道。
+
+**根因**：① rework 循环内 worker turn 失败被当作整个闭环的终态（fail-fast 无重试），而该 turn 实际已产出有效修复（repositoryAfter fingerprint 与 slugify.mjs 内容变化证明）；② confirmed 仅在 recordReviewFindings 中"同一 review_changes 调用内 rework 闭环以 PASS 收口"时从 worker fix prompts 恢复写入（tools.ts:1169），独立复审 PASS 没有 rework 上下文，设计上无法补记；③ vendor turn 失败被压缩为 UnknownError（P-078 同源），0 字节输出使失败不可归因。
+
+**解决方法**：① rework worker turn 失败时先比对 repository fingerprint：若 fix 已落盘则重试复审而非直接终止闭环；② `review_changes` 允许显式传 `reworkClosure: { workerSessionId, rounds }` 让人工续接的复审能写 confirmed；③ 落实 P-078 的错误保真。
+
+**状态**：部分修复（2026-09-03）——①已修复：rework 循环在 worker turn 失败时直接比对 fix turn 前后 captureRepositoryState 指纹，工作树已变化则继续复审而非终止闭环，p5-unattended.test.ts 正反两个回归用例覆盖（落盘续审/无变化照旧 abort）；③已随 P-078 修复。②`reworkClosure` 显式补记参数未实现，独立复审 PASS 的 confirmed 仍无补记通道，维持立案。
+
+## P-078 opencode 适配器压缩 vendor 错误信息为 APIError/UnknownError，破坏错误分类与升级链路由（v0.4 真实压测 T0-T5 发现、T7 定案）
+
+**问题**：opencode 通道的 vendor 侧失败在 AgentMesh 结果中仅呈现 "APIError" 或 "UnknownError"：无法区分 MODEL_REJECTED / CAPABILITY_MISMATCH / 瞬时网络错误 / 内容策略拒绝，自动调整循环只能按 TRANSIENT 盲目重试，无法按 error_code 沿 hint.nextCandidates 升级链重派。T0-T5 阶段首次发现，T7 rework turn 失败（exit 1、0 字节输出、UnknownError）使闭环断裂损失扩大，定案立案。
+
+**根因**：`src/agents/opencode.ts` 对 opencode JSONL 事件流的 error 事件提取过于激进，仅保留 message 字段的窄切片（且 vendor 常把真实原因放在多级嵌套的 data 字段），适配器边界把结构化错误压扁成单字符串。
+
+**解决方法**：parseOpenCodeJsonLines 保留 error 事件的原始 JSON 片段（截断到安全长度）作为 errorDetail 附加字段；错误分类器对 opencode 适配器输出增加 name/data.name 维度，至少区分 MODEL_REJECTED 与 TRANSIENT。
+
+**状态**：已修复（2026-09-03）——parseOpenCodeJsonLines 对非字符串 error 事件保留 primary 字段并追加原始 JSON 片段（截断 400 字符），分类器可对完整错误文本匹配 MODEL_REJECTED/TRANSIENT 特征；args.test.ts 回归覆盖。errorDetail 独立结构化字段未实现（当前并入 error 字符串），升级链重派依赖分类器对文本匹配。
+
+## P-079 workflow 对 isRetryable 瞬态 dispatch 失败无退避重试且无断点续跑（v0.4 第二轮 air 压测）
+
+**问题**：air 压测中 implement-content 首次派发遇 opencode/tokenrhythm glm-5.3-flash vendor 503（「模型服务暂时不可用」isRetryable:true，86s、0 token），workflow 立即以 dispatch 失败 ESCALATED 终态（fail-closed 行为本身正确），但无任何内置重试通道；且 `workflow run` 只能整跑，已 passed 的 validators/implement-engine 阶段重跑时会重复消耗真实配额，只能人工裁剪 spec 变体恢复闭环。
+
+**根因**：StagePolicySpec.reRouteOnStall 仅覆盖 stall 分类失败（timeout/watchdog 终止），dispatchWithReRoute 对 APIError isRetryable:true 类 TRANSIENT 失败直接返回终态；CLI 只有 `workflow run|status`，checkpoint 快照虽已落盘但无 `--resume` 断点续跑入口。
+
+**解决方法**：① dispatchWithReRoute 对 isRetryable TRANSIENT 失败增加有界指数退避重试（如 `policy.retryTransient`，默认 1 次）；② `workflow run --resume <workflowId>` 从已持久化 checkpoint 恢复，仅执行 pending 阶段，跳过已 passed 阶段。
+
+**状态**：未修复（2026-09-04 立案；证据 = wf_mtlr056zb5ab8b69 ESCALATED 链 + metrics.jsonl 503 记录；本次以人工裁剪 spec 变体 wf_mtlrioind5ae1847 恢复闭环）
+
+## P-080 组长（主模型 Orchestrator）上下文节流依赖纪律无引擎默认值，消耗占比失控（newsradar 项目实测 3-4 倍于 worker）
+
+**问题**：newsradar（v04_demo）项目实测组长 token 消耗达 worker 的 3-4 倍，偏离"省 token"的原始设计目标。结构上组长为多轮会话——每轮输入含全部历史，消耗 O(n²) 累积，而 worker 为单次任务 O(n)；叠加主模型与免费模型数十倍单价差，实际成本差更大。四个典型泄漏点：①检查员化（diff 逐行核对、测试输出分析、长报告阅读本应派免费 reviewer）；②大文件整读进组长上下文后逐轮重复计费；③poll_task/get_workflow 返回的全量 JSON 快照直灌上下文；④阶段结束后不主动压缩，已完成阶段原始产出陪跑。健康基准应为组长占比 10-20%，超 25% 即越界。r17 轮 6.83M tokens 即同源教训（AGENTS.md §2.5 因此立了组长节流纪律），但纪律靠自觉，newsradar 实测证明不可靠。
+
+**根因**：v0.4 把"流转与监工"的 token 从主模型挪进了状态机与免费模型，但组长自身的上下文管理没有任何引擎级约束——get_workflow/escalated 证据链默认返回全量数据、返回体无指针化截断、无消耗占比告警，节流完全依赖组长相册式自律。这与 v0.4 自身"把靠自觉改成靠机制"的设计哲学相悖。
+
+**解决方法**：①get_workflow/poll_task/escalated 证据链默认 compact 模式（状态枚举+结论性摘要+证据文件指针），`detail:"full"` 显式才给全量；②面向组长的返回体超过 2KB 自动落盘 out/ 并只回尾部 1.5KB+路径（把 tail-2KB 惯例升级为引擎行为）；③新增组长副官工具 `summarize_for_leader(target, focusQuestion)`——免费模型预读大文件/长输出只回 ≤300 字答案+指针，组长物理上不接触大块内容；④stats 增加 leaderShare 派生指标（组长消耗/项目总消耗），超 25% 阈值告警；⑤终态经 MCP notifications 主动推送替代轮询。落地优先级：①②（引擎小改收益最大）→ ③（新增角色）→ ④⑤（增强）。
+
+**状态**：未修复，v0.5 设计已定稿（2026-09-07 立案；证据 = newsradar 项目组长/worker 消耗比 3-4 倍 + r17 轮 6.83M tokens 事后复盘；预期方案①②③落地后组长占比压回 15% 以内。设计定稿见 `v0.5_设计_需求对账单架构.md`：①②落 Batch 1、③即副官工具（Batch 2）、④⑤落 Batch 3，并吸收前人方案补两层归档——Tier1 规则化清场（workflow 终态占位符归档，零 token，参照 ClaudeCode microcompact）先于 Tier2 LLM 压缩阈值兜底）

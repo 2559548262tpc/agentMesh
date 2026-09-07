@@ -408,6 +408,40 @@ describe("agents/args construction", () => {
     expect(parsed.usage).toBeUndefined();
   });
 
+  // P-078: the vendor nests the actionable cause (model id, HTTP status,
+  // upstream body) under auxiliary fields while the extracted field is often a
+  // bare name like "APIError" — flattening to that name alone defeats
+  // classifyErrorCode and the escalation chain.
+  it("keeps the raw error payload alongside the extracted summary", () => {
+    const parsed = parseOpenCodeJsonLines(
+      JSON.stringify({
+        type: "error",
+        error: {
+          name: "APIError",
+          message: "request failed",
+          data: { status: 404, body: "model opencode/xyz not found" },
+        },
+      }),
+    );
+    expect(parsed.error).toContain("request failed");
+    expect(parsed.error).toContain("not found");
+    expect(parsed.error!.length).toBeLessThanOrEqual(450);
+  });
+
+  it("prefers the message field for error classification signals", () => {
+    const parsed = parseOpenCodeJsonLines(
+      JSON.stringify({ type: "error", error: { name: "APIError", message: "unknown model foo" } }),
+    );
+    expect(parsed.error).toContain("unknown model foo");
+  });
+
+  it("handles string errors without appending a payload", () => {
+    const parsed = parseOpenCodeJsonLines(
+      JSON.stringify({ type: "error", error: "plain failure" }),
+    );
+    expect(parsed.error).toBe("plain failure");
+  });
+
   it("exposes semantic errors from successful JSON transports", () => {
     const antigravity = parseAntigravityJsonOutput(
       JSON.stringify({

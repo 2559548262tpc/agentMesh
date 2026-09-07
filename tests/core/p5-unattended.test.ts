@@ -415,6 +415,68 @@ describe("reviewChanges rework loop (P5 T5.1)", () => {
     expect(worker.runs).toBe(0);
   });
 
+  it("continues the loop when a failed fix turn still landed changes (P-077)", async () => {
+    reviewer.enqueue(FAIL_TURN);
+    reviewer.enqueue({
+      status: "success",
+      summary: "Review PASSED: The landed fix resolves the finding.",
+      reviewOutcome: "PASS",
+    });
+
+    // Simulates a vendor dying mid-turn (failed status) AFTER the fix was
+    // already written to the working tree.
+    class FixThenFailAdapter extends ScriptedAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        fs.writeFileSync(path.join(options.cwd!, "fix.ts"), "export const fixed = true;\n");
+        return super.runViaCli(options);
+      }
+    }
+    const fixer = new FixThenFailAdapter("claude");
+    registry.register(fixer);
+    fixer.enqueue({ status: "failed", summary: "vendor died mid-turn" });
+
+    const workerSession = sessionManager.createSession({
+      agent: "claude",
+      cwd: repo,
+      role: "worker",
+    });
+    const result = await runner.reviewChanges({
+      cwd: repo,
+      agent: "codex",
+      maxReworkRounds: 3,
+      workerSessionId: workerSession.id,
+    });
+
+    expect(result.reviewOutcome).toBe("PASS");
+    expect(reviewer.runs).toBe(2);
+    expect(result.rework?.log).toEqual([{ round: 1, fixStatus: "failed", reviewOutcome: "PASS" }]);
+    expect(result.warning).toContain("re-reviewing the landed change");
+  });
+
+  it("aborts the loop when a failed fix turn changed nothing (P-077)", async () => {
+    reviewer.enqueue(FAIL_TURN);
+    worker.enqueue({ status: "failed", summary: "vendor died before writing anything" });
+
+    const workerSession = sessionManager.createSession({
+      agent: "claude",
+      cwd: repo,
+      role: "worker",
+    });
+    const result = await runner.reviewChanges({
+      cwd: repo,
+      agent: "codex",
+      maxReworkRounds: 2,
+      workerSessionId: workerSession.id,
+    });
+
+    expect(result.reviewOutcome).toBe("FAIL");
+    expect(reviewer.runs).toBe(1);
+    expect(result.rework?.log).toEqual([
+      { round: 1, fixStatus: "failed", reviewOutcome: "UNKNOWN" },
+    ]);
+    expect(result.warning).toContain("aborted");
+  });
+
   it("rubric rides the strict review contract into the role prompt", () => {
     const withRubric = buildRolePrompt("inspect", "reviewer", { rubric: true });
     expect(withRubric).toContain("Review Rubric");

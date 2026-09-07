@@ -92,11 +92,26 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
         }
       }
       if (type === "error" || event.error) {
-        error =
-          typeof event.error === "string"
-            ? event.error
-            : findStringField(event.error, new Set(["message", "name", "code"])) ||
-              "OpenCode returned an error event";
+        if (typeof event.error === "string") {
+          error = event.error;
+        } else {
+          const primary =
+            findStringField(event.error, new Set(["message", "name", "code"])) ||
+            "OpenCode returned an error event";
+          // P-078: the vendor nests the actionable cause (model id, HTTP
+          // status, upstream body) under auxiliary/nested fields, while the
+          // extracted field is often just a bare name like "APIError".
+          // Flattening to that name alone defeats classifyErrorCode
+          // (MODEL_REJECTED vs TRANSIENT) and the escalation chain, so the
+          // raw payload is appended, bounded to keep logs and results sane.
+          let raw: string | undefined;
+          try {
+            raw = JSON.stringify(event.error);
+          } catch {
+            raw = undefined;
+          }
+          error = raw ? `${primary} | ${raw.slice(0, 400)}` : primary;
+        }
       }
     } catch {
       // Preserve compatibility with older/default output if a CLI emits mixed lines.

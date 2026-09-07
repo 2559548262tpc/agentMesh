@@ -506,9 +506,13 @@ describe("core/runner", () => {
         task: "Review without editing",
       });
 
+      // Since P-076, `.agentmesh/` is filtered out of repository evidence itself,
+      // so the tree guard never even sees the change (the guard-level exclusion
+      // from P-R21-4 moved down into captureRepositoryState). The base prompt-only
+      // mechanism disclosure remains, but no .agentmesh exclusion warning appears.
       expect(result.status).toBe("success");
       expect(result.reviewerSafety).toMatchObject({ workspaceChanged: false });
-      expect(result.reviewerSafety?.warning).toContain(".agentmesh/");
+      expect(result.reviewerSafety?.warning).not.toContain(".agentmesh/");
     } finally {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
