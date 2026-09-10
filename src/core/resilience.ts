@@ -19,6 +19,14 @@ const MODEL_REJECTION_PATTERN =
   /\b(?:invalid|unsupported)[_-]?model\b|model.{0,40}not\s+(?:supported|available|found|valid)|does\s+not\s+have\s+access|no\s+access\s+to\s+model|model[_-]not[_-]found|模型不存在|unknown\s+model|no\s+such\s+model/i;
 const TRANSIENT_PATTERN =
   /\b(?:5\d\d|408|429)\b|\b(?:internal\s+server\s+error|bad\s+gateway|service\s+unavailable|server\s+error|overloaded|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|request\s+timeout|stream_error|fetch\s+failed|socket\s+hang\s+up)\b|connection\s+(?:refused|reset|closed|timed?\s?out)|ECONN(?:RESET|REFUSED|ABORTED)|ETIMEDOUT/i;
+/**
+ * TLS/SSL handshake failures (ISS-7: "unknown certificate verification error"
+ * surfaced as a bare UnknownError by the opencode vendor): intermittent
+ * network-layer failures that heal on retry, hence TRANSIENT_5XX-classified
+ * so the resilient retry layer covers them.
+ */
+const TRANSIENT_TLS_PATTERN =
+  /\b(?:unknown\s+certificate\s+verification\s+error|certificate\s+verification\s+(?:failed|error)|self[ _-]signed\s+cert|EPROTO\b|ERR_TLS|SSL\s+(?:handshake\s+)?(?:error|routines)|TLS\s+(?:handshake\s+)?(?:error|failure)|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT)\b/i;
 const SANDBOX_PATTERN =
   /\bsandbox\b.{0,80}\b(?:unavailable|blocked|denied|not\s+(?:enabled|activated))\b|\bspawn\s+EPERM\b.{0,80}\bsandbox\b/i;
 const PARSE_FAILURE_PATTERN =
@@ -31,6 +39,13 @@ export interface FailureSignal {
   exitCode?: number;
   timedOut?: boolean;
   aborted?: boolean;
+  /**
+   * ISS-2: explicit HTTP status extracted from the vendor error payload
+   * (opencode parse). P-079①: a 408/429/5xx status classifies as TRANSIENT_5XX
+   * even when the compressed vendor message carries no recognizable keyword,
+   * so the resilient retry layer covers plain "APIError"-style 503s.
+   */
+  httpStatus?: number;
 }
 
 /**
@@ -44,6 +59,16 @@ export function classifyErrorCode(signal: FailureSignal): ErrorCode | undefined 
   if (signal.timedOut) return "TIMEOUT";
 
   const message = signal.message ?? "";
+  // P-079①: an explicit retryable HTTP status wins over everything message
+  // related, including the empty-message early return (compressed vendor
+  // payloads like bare "APIError" carry no recognizable keyword).
+  if (
+    signal.httpStatus === 408 ||
+    signal.httpStatus === 429 ||
+    (signal.httpStatus !== undefined && signal.httpStatus >= 500)
+  ) {
+    return "TRANSIENT_5XX";
+  }
   if (!message) {
     return signal.exitCode === 127 ? "SPAWN_FAILED" : undefined;
   }
@@ -53,6 +78,7 @@ export function classifyErrorCode(signal: FailureSignal): ErrorCode | undefined 
   if (VENDOR_QUOTA_PATTERN.test(message)) return "VENDOR_QUOTA";
   if (MODEL_REJECTION_PATTERN.test(message)) return "MODEL_REJECTED";
   if (TRANSIENT_PATTERN.test(message)) return "TRANSIENT_5XX";
+  if (TRANSIENT_TLS_PATTERN.test(message)) return "TRANSIENT_5XX";
   if (SANDBOX_PATTERN.test(message)) return "SANDBOX_UNAVAILABLE";
   if (PARSE_FAILURE_PATTERN.test(message)) return "PARSE_FAILURE";
   if (ARG_REJECTION_PATTERN.test(message)) return "ARG_REJECTED";

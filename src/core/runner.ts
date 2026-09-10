@@ -47,6 +47,8 @@ import {
 import { classifyErrorCode } from "./resilience.js";
 import { buildSummaryPrompt, stripAnalysisDraft, buildReworkFixPrompt } from "./prompts.js";
 import { truncateText } from "./text.js";
+import { archiveSessionHistory } from "./archive.js";
+import type { ArchiveSessionReport } from "./archive.js";
 import { evaluateBudgetGate } from "./budget.js";
 import { type CheckpointStore, defaultCheckpointStore } from "./checkpoint.js";
 import type {
@@ -519,7 +521,22 @@ function predictTransport(
  * Detects vendor-level refusals of a requested model id (HTTP 4xx family,
  * "unsupported/invalid model" wording). Conservative on purpose: both the
  * model id and a refusal signal must appear before a diagnostic is emitted.
+ *
+ * ISS-1: a single observation is reported as a suspected transient refusal —
+ * vendor 403s (quota pre-check races, gateway blips) recur with the same
+ * model id text and previously read as a permanent model-level conclusion,
+ * misleading the candidate chain. Only a repeat observation for the same
+ * model within the confirmation window upgrades the wording to a confirmed
+ * refusal. Never used by the engine to block dispatches — advisory only.
  */
+const MODEL_REJECTION_CONFIRM_WINDOW_MS = 30 * 60_000;
+const modelRejectionObservations = new Map<string, { count: number; firstAtMs: number }>();
+
+/** Test seam: clears the ISS-1 rejection observation memory. */
+export function resetModelRejectionDiagnostics(): void {
+  modelRejectionObservations.clear();
+}
+
 export function modelRejectionDiagnostic(params: { model?: string; text?: string }): string[] {
   const { model, text } = params;
   if (!model || !text) return [];
@@ -528,9 +545,31 @@ export function modelRejectionDiagnostic(params: { model?: string; text?: string
   const refusalSignal =
     /\b(?:400|401|403|404)\b|invalid[_-]?model|unsupported[_-]?model|model.{0,40}(?:not\s+(?:supported|available|found|valid)|is\s+unavailable)|does\s+not\s+have\s+access|no\s+access\s+to\s+model/i;
   if (!refusalSignal.test(text)) return [];
+
+  const nowMs = Date.now();
+  const previous = modelRejectionObservations.get(model);
+  const confirmed =
+    previous !== undefined && nowMs - previous.firstAtMs <= MODEL_REJECTION_CONFIRM_WINDOW_MS;
+  modelRejectionObservations.set(model, {
+    count: confirmed ? (previous?.count ?? 1) + 1 : 1,
+    firstAtMs: confirmed && previous ? previous.firstAtMs : nowMs,
+  });
+
+  const observedAt = new Date(nowMs).toISOString();
+  if (!confirmed) {
+    return [
+      `Capability diagnostic (single observation, ${observedAt}): model '${model}' was ` +
+        "rejected by the vendor — classified as a SUSPECTED TRANSIENT refusal. A single " +
+        "observation is not a model-level conclusion (ISS-1): re-dispatch to confirm " +
+        "before treating the model as unavailable.",
+    ];
+  }
+  const observations = modelRejectionObservations.get(model)!;
   return [
-    `Capability diagnostic: model '${model}' was rejected by the vendor (account/model-id level refusal detected in the error text); ` +
-      "the request was NOT applied. Verify the model id and account entitlement.",
+    `Capability diagnostic (confirmed, ${observedAt}): model '${model}' was rejected by ` +
+      `the vendor on ${observations.count} observations since ${new Date(observations.firstAtMs).toISOString()} ` +
+      "(account/model-id level refusal detected in the error text); the request was NOT " +
+      "applied. Verify the model id and account entitlement.",
   ];
 }
 
@@ -2588,6 +2627,45 @@ export class MultiAgentRunner {
    */
   public getSession(sessionId: string): BridgeSession | undefined {
     return this.sessionManager.getSession(sessionId);
+  }
+
+  /**
+   * v0.5 Tier 1 rule-based cleanup (design §6): replaces the bulky raw
+   * payloads (task echo, finalAnswer) of a finished workflow's Bridge sessions
+   * with a pointer placeholder. Sessions in `keepSessionIds` (the last executed
+   * stage's sessions) keep their most recent turn verbatim. Deterministic,
+   * zero tokens; unknown session ids are reported honestly via `missing`.
+   */
+  public archiveWorkflowSessions(params: {
+    archiveSessionIds: readonly string[];
+    keepSessionIds: readonly string[];
+    ledgerRef: string;
+  }): { reports: ArchiveSessionReport[]; missing: string[] } {
+    const keep = new Set(params.keepSessionIds);
+    const reports: ArchiveSessionReport[] = [];
+    const missing: string[] = [];
+    for (const sessionId of params.archiveSessionIds) {
+      const session = this.sessionManager.getSession(sessionId);
+      if (!session) {
+        missing.push(sessionId);
+        continue;
+      }
+      const keepTurnIndexes =
+        keep.has(sessionId) && session.history.length > 0
+          ? new Set([session.history.length - 1])
+          : undefined;
+      const history = archiveSessionHistory(session, {
+        ledgerRef: params.ledgerRef,
+        ...(keepTurnIndexes ? { keepTurnIndexes } : {}),
+      });
+      this.sessionManager.updateSession(sessionId, { history });
+      reports.push({
+        sessionId,
+        archivedTurns: history.length - (keepTurnIndexes?.size ?? 0),
+        keptTurns: keepTurnIndexes?.size ?? 0,
+      });
+    }
+    return { reports, missing };
   }
 
   /**

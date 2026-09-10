@@ -15,7 +15,13 @@ export type AgentMeshEvent =
       status: "completed" | "failed";
       exitCode?: number;
     }
-  | { type: "task.stalled"; taskId: string };
+  | { type: "task.stalled"; taskId: string }
+  /**
+   * Workflow-engine terminal push (v0.5 Batch 3 #12, P-080⑤): `taskId` carries
+   * the workflowId; status is the terminal WorkflowOverallStatus (done /
+   * needs_ruling / escalated / failed). Emitted once per run at terminal.
+   */
+  | { type: "workflow.terminal"; taskId: string; status: string };
 
 export type AgentMeshEventListener = (event: AgentMeshEvent) => void;
 

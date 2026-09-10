@@ -715,4 +715,43 @@ describe("mcp/tools protocol integration", () => {
       fs.rmSync(projectDir, { recursive: true, force: true });
     }
   });
+
+  it("enforces v0.5 requirement ids as required map entries (missing and unknown-item)", async () => {
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-contractmap-req-"));
+    try {
+      fs.writeFileSync(
+        path.join(projectDir, "borrow.ts"),
+        "export function borrow() {\n  return 400;\n}\n",
+        "utf-8",
+      );
+      const res = await client.callTool({
+        name: "verify_contract_map",
+        arguments: {
+          contractItems: [{ id: "C1", text: "exports borrow" }],
+          requirementIds: ["R1", "R2"],
+          map: [
+            { id: "C1", file: "borrow.ts", line: 1 },
+            // R1 mapped correctly; R2 has no entry; R9 is not a declared id.
+            { id: "R1", file: "borrow.ts", line: 2 },
+            { id: "R9", file: "borrow.ts", line: 3 },
+          ],
+          cwd: projectDir,
+        },
+      });
+
+      expect(res.isError).toBe(true);
+      const content = res.content as Array<{ type: string; text: string }>;
+      const report = JSON.parse(content[0]!.text) as {
+        pass: boolean;
+        items: Array<{ id: string; status: string }>;
+      };
+      expect(report.pass).toBe(false);
+      const byId = new Map(report.items.map((item) => [item.id, item]));
+      expect(byId.get("R1")).toMatchObject({ status: "ok" });
+      expect(byId.get("R2")).toMatchObject({ status: "missing" });
+      expect(byId.get("R9")).toMatchObject({ status: "unknown-item" });
+    } finally {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -129,7 +129,10 @@ describe("mcp background delegate and poll_task", () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
-  const waitFor = async (condition: () => boolean, timeoutMs = 5000): Promise<void> => {
+  const waitFor = async (condition: () => boolean, timeoutMs = 15_000): Promise<void> => {
+    // 15s default: the full `npm run check` suite runs this file under
+    // coverage + parallel workers, which can slow event delivery well past
+    // the previous 5s and turn green tests into flaky timeouts.
     const deadline = Date.now() + timeoutMs;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error("waitFor timed out");
@@ -191,9 +194,9 @@ describe("mcp background delegate and poll_task", () => {
     });
     const firstOutcome = JSON.parse(
       (first.content as Array<{ type: string; text: string }>)[0]!.text,
-    ) as { status: string; outputSinceOffset: string };
+    ) as { status: string; outputTail: string };
     expect(firstOutcome.status).toBe("running");
-    expect(firstOutcome.outputSinceOffset).toContain("started\n");
+    expect(firstOutcome.outputTail).toContain("started\n");
 
     // Second poll still running while the gate stays closed.
     const second = await client.callTool({ name: "poll_task", arguments: { taskId } });
@@ -203,7 +206,7 @@ describe("mcp background delegate and poll_task", () => {
 
     gate.open();
 
-    let terminal: { status: string; result?: { summary?: string }; outputSinceOffset: string };
+    let terminal: { status: string; result?: { summary?: string }; outputTail: string };
     for (let attempt = 0; attempt < 50; attempt++) {
       const poll = await client.callTool({ name: "poll_task", arguments: { taskId } });
       terminal = JSON.parse(
@@ -214,7 +217,7 @@ describe("mcp background delegate and poll_task", () => {
     }
     expect(terminal!.status).toBe("completed");
     expect(terminal!.result?.summary).toBe("Background finished");
-    expect(terminal!.outputSinceOffset).toContain("finished\n");
+    expect(terminal!.outputTail).toContain("finished\n");
   });
 
   it("reports a structured NOT_FOUND for an unknown taskId", async () => {
@@ -271,7 +274,9 @@ describe("mcp background delegate and poll_task", () => {
     await clientTransport.close();
     await serverTransport.close();
 
-    for (let attempt = 0; attempt < 50; attempt++) {
+    // Under the full suite (coverage + parallel workers) the abort can take
+    // noticeably longer than the previous 5s budget.
+    for (let attempt = 0; attempt < 100; attempt++) {
       if (background.activeCount === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -405,7 +410,10 @@ describe("mcp background M7b queue (cap, deps, priority)", () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
-  const waitFor = async (condition: () => boolean, timeoutMs = 5000): Promise<void> => {
+  const waitFor = async (condition: () => boolean, timeoutMs = 15_000): Promise<void> => {
+    // 15s default: the full `npm run check` suite runs this file under
+    // coverage + parallel workers, which can slow event delivery well past
+    // the previous 5s and turn green tests into flaky timeouts.
     const deadline = Date.now() + timeoutMs;
     while (!condition()) {
       if (Date.now() > deadline) throw new Error("waitFor timed out");

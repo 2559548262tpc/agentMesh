@@ -48,19 +48,26 @@ describe("core/repository evidence", () => {
     expect(state?.pathFingerprints).toBeUndefined();
   });
 
-  it("keeps untracked fingerprints deterministic beyond the content-hash cap", async () => {
-    for (let index = 0; index < 505; index += 1) {
-      fs.writeFileSync(path.join(repositoryRoot, `u${index}.txt`), "x");
-    }
+  // 505 file writes + two state captures are inherently slow; under the full
+  // `npm run check` suite (coverage + parallel workers) the 20s default is
+  // not enough, so give this one an explicit budget.
+  it(
+    "keeps untracked fingerprints deterministic beyond the content-hash cap",
+    { timeout: 60_000 },
+    async () => {
+      for (let index = 0; index < 505; index += 1) {
+        fs.writeFileSync(path.join(repositoryRoot, `u${index}.txt`), "x");
+      }
 
-    const first = await captureRepositoryState(repositoryRoot);
-    const second = await captureRepositoryState(repositoryRoot);
-    expect(second?.fingerprint).toBe(first?.fingerprint);
+      const first = await captureRepositoryState(repositoryRoot);
+      const second = await captureRepositoryState(repositoryRoot);
+      expect(second?.fingerprint).toBe(first?.fingerprint);
 
-    fs.writeFileSync(path.join(repositoryRoot, "u0.txt"), "changed");
-    const third = await captureRepositoryState(repositoryRoot);
-    expect(third?.fingerprint).not.toBe(first?.fingerprint);
-  });
+      fs.writeFileSync(path.join(repositoryRoot, "u0.txt"), "changed");
+      const third = await captureRepositoryState(repositoryRoot);
+      expect(third?.fingerprint).not.toBe(first?.fingerprint);
+    },
+  );
 
   it("returns undefined outside a git repository", async () => {
     const plainDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-plain-"));

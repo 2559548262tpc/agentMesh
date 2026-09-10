@@ -4,6 +4,17 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+### v0.5 Batch 1 — 需求对账单架构（v0.5*设计*需求对账单架构.md #0-#6）
+
+#### Added
+
+- **需求贯穿（Batch 1 #1/#2）：** WorkflowSpec 的 stage 增加可选 `requirements: ["R1",…]` 声明；`acceptance.commands` 同时接受旧字符串与 `{cmd, covers:["R1"]}` 对象（兼容非破坏）。新增 requirements.json 格式（EARS 五模式句式 + `quote` 原文引用 + `decidable` 标记）与引擎边界校验：`quote` 必须为源文档真实子串（机械核验，零 token 防蒸馏编造）、kind 必须与 EARS 句式一致、条数对文档结构单元做对数粗核验（warning 级）。`run_workflow` 增 `requirementsPath` 参数、`agentmesh workflow run` 增 `--requirements`。
+- **终态对账单（Batch 1 #4）：** workflow 终态由引擎 join 出 reconciliation ledger 落盘 `<agentmeshHome>/out/ledger_<workflowId>.json`：每条需求一行（PASS/FAIL/ESCALATED/PENDING_RULING + 验收命令证据 + findings），跨 stage 合取语义（任一 declaring stage 未通过则不为 PASS；stage 通过但无 covering 命令证据 → PENDING_RULING，fail-closed）。对数硬不变量 `n(requirements) == Σn(status)` 独立复算；存在 PENDING_RULING 行时终态为 `needs_ruling`（新状态）而非 done——快车道不得携带未裁决条目安静完成。CLI 退出码 0/1/2/3 = done/failed/escalated/needs_ruling。
+- **compact 返回 + Tier 0 截断（Batch 1 #5，P-080①②）：** `get_workflow`/`poll_task` 默认返回 compact 封套（状态枚举 + 每阶段状态 + flag 位 unresolvedP0P1/coverage/anomalies + ledger 指针；poll 为状态 + nextOffset + ≤1.5KB 增量尾部 + 输出文件指针），`detail:"full"` 显式取全量。Tier 0 为无条件引擎行为：任一面向组长的返回体超过 2KB 自动落盘 `<agentmeshHome>/out/` 并只回尾部 1.5KB + 路径——大输出从未进入组长上下文。
+- **Tier 1 规则化清场（Batch 1 #6）：** workflow 终态时，该 workflow 产出的 Bridge 会话中除"最近一个 stage 保留最新一轮"外，历史条目的 task 回显与 finalAnswer 原文替换为指针占位符 `[archived → <ledgerRef>]`，summary/findings/usage/evidence 保留——下游 `contextSessionIds` 复用只带摘要+指针。零 token、确定性；仅作用于 AgentMesh 侧会话（宿主侧组长历史引擎不可改写，Tier 0 负责防新注入）。
+- **leaderShare 度量先行（Batch 1 #0，P-080④）：** `TaskMetrics` 增 `lane` 维度（fast/standard/gated/full，Batch 2 分诊填充），`agentmesh stats` 按 lane 聚合并支持 `--leader-tokens <n>`（宿主侧组长消耗，引擎不 meter 宿主、绝不伪造）计算 leaderShare，超 25% 阈值输出 `LEADER_SHARE_EXCEEDED` 告警。
+- **contract map 按 R 申报（Batch 1 #3）：** `verify_contract_map` 增 `requirementIds`：R id 成为必映射项（缺失 = missing，未声明条目 = unknown-item），契约清单可直接引用需求 id。
+
 ### v0.4 改造方案（ROADMAP_v0.4.md，M0-M7）
 
 #### Added
@@ -36,6 +47,24 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - M7 生命周期原语与交接保真（全部落地：`handoff_diff`、优先级队列、依赖 DAG、`pause_task`；遗留面板语义跟进项见下文）
 
 **已知跟进项（v0.5 候选）**：排队派发在注册时即发出 `task.started`（"已受理"公告），面板消费方可能把排队任务显示为"已启动"——面板侧需要区分 queued/started 两种事件语义。
+
+### 问题清单收口（2026-09-08，PROBLEMS.md P-079/P-080⑤/P-081 + ISS 系列）
+
+#### Fixed
+
+- **P-081 opencode 零 text 事件 summary 污染：** `parseOpenCodeJsonLines` 增 `normalizedEmpty` 信号（解析到事件流但零 text 回答），summary 用角色化占位符替代原始 JSONL 事件碎片并附 warning——vendor 事件行不再冒充人类可读摘要。
+- **P-079② workflow 断点续跑：** `run_workflow` MCP 增 `resumeFromWorkflowId`、CLI `workflow run --resume <workflowId>`，从持久化 snapshot 继承 passed 阶段（同 spec 名硬校验），仅重跑 pending 阶段，不重复消耗真实配额；引擎正反回归用例覆盖。
+- **P-079① 瞬态重试闭环：** `classifyErrorCode` 直接消费 `httpStatus`（408/429/5xx → TRANSIENT_5XX，message 无特征词也可靠分类），opencode 解析出的 HTTP 状态码喂入分类器——裸 "APIError" 503 现在能进入既有 `executeWithResilientRetries` 退避重试层（此前因 P-078 错误压缩无法分类而漏判）。
+- **ISS-7 TLS 错误分类：** `TRANSIENT_TLS_PATTERN` 把证书/TLS 握手类错误归为 TRANSIENT_5XX（可重试）而非裸 UnknownError。
+- **ISS-1 误判缓解：** model rejection 诊断引入 30 分钟多观测确认窗口，单样本不再直接定罪。
+- **ISS-5 poll_task 长轮询封顶：** `maxWaitMs` 被引擎封顶 `min(maxWaitMs, 25s)`（`POLL_MAX_WAIT_CAP_MS`），避免宿主 30s 请求超时被引擎的长轮询触发。
+- **ISS-6 注册表终态孤儿：** 被 reap/expired 的注册表条目不再让持久化终态结果失联——poll_task 在记录缺失时回读持久化 result 文件返回终态，而非裸 NOT_FOUND。
+- **P-080⑤ workflow 终态推送：** 引擎终态经 event bus 发 `workflow.terminal`，MCP server 转发 logging notification，宿主无需轮询即可知晓 workflow 结束（poll_task/get_workflow 仍是可靠兜底）。
+
+#### Changed
+
+- **#9.5 延迟感知路由：** `orderCandidatesByHealth` 在健康分并列时按 p50 时延升序排列，候选升级链优先选择实测更快的模型。
+- 测试加固：全量 `npm run check` 高负载下三处环境性 flaky（waitFor 等待预算、git 子进程 EBUSY 清理重试、慢测试超时预算）修复。
 
 ## 0.3.0 - 2026-09-02
 

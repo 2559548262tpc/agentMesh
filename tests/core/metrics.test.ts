@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   aggregateTaskMetrics,
   appendTaskMetrics,
+  computeLeaderShare,
   readTaskMetrics,
   resolveMetricsFilePath,
+  sumDispatchedTokens,
 } from "../../src/core/metrics.js";
 import type { MetricsGroupStats, TaskMetrics } from "../../src/core/metrics.js";
 
@@ -307,5 +309,69 @@ describe("core/metrics aggregation", () => {
     expect(week.byModel.map((group) => group.key)).toEqual(["fresh", "stale"]);
     const all = aggregateTaskMetrics([fresh, stale, old], { window: "all", nowMs });
     expect(all.taskCount).toBe(3);
+  });
+
+  it("aggregates dispatches by v0.5 triage lane, grouping unlabeled records under unknown", () => {
+    const fast = { ...baseRecord, lane: "fast" as const, taskId: "t-fast" };
+    const full = { ...baseRecord, lane: "full" as const, taskId: "t-full" };
+    const unlabeled = { ...baseRecord, taskId: "t-unknown" };
+
+    const aggregate = aggregateTaskMetrics([fast, full, unlabeled]);
+    const keys = aggregate.byLane.map((group) => group.key).sort();
+    expect(keys).toEqual(["fast", "full", "unknown"]);
+  });
+
+  it("drops unknown lane values at parse time instead of guessing", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-metrics-lane-")));
+    try {
+      appendTaskMetrics(baseRecord, { homeDir: home });
+      const filePath = resolveMetricsFilePath(home);
+      fs.appendFileSync(
+        filePath,
+        `${JSON.stringify({ ...baseRecord, taskId: "t-bogus", lane: "express" })}\n`,
+        "utf-8",
+      );
+      const records = readTaskMetrics({ homeDir: home });
+      expect(records).toHaveLength(1);
+      expect(records[0]!.lane).toBeUndefined();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("core/metrics leaderShare (v0.5 P-080④)", () => {
+  const baseRecord: TaskMetrics = {
+    role: "worker",
+    agent: "codex",
+    tokensIn: 100,
+    tokensOut: 50,
+    durationMs: 10,
+    retries: 0,
+    stallEvents: 0,
+    cancelEvents: 0,
+    outcome: "ok",
+    startedAt: "2026-09-01T10:00:00.000Z",
+    endedAt: "2026-09-01T10:00:00.010Z",
+  };
+
+  it("sums dispatch tokens excluding stall events", () => {
+    expect(sumDispatchedTokens([baseRecord, { ...baseRecord, outcome: "stalled" }])).toBe(150);
+  });
+
+  it("derives the share and warns above the 25% threshold", () => {
+    const within = computeLeaderShare({ leaderTokens: 50, dispatchedTokens: 150 });
+    expect(within.share).toBeCloseTo(0.25);
+    expect(within.warning).toBeUndefined();
+
+    const exceeding = computeLeaderShare({ leaderTokens: 75, dispatchedTokens: 25 });
+    expect(exceeding.share).toBeCloseTo(0.75);
+    expect(exceeding.warning).toContain("LEADER_SHARE_EXCEEDED");
+  });
+
+  it("never fabricates a share without a positive denominator", () => {
+    const report = computeLeaderShare({ dispatchedTokens: 0 });
+    expect(report.share).toBeUndefined();
+    expect(report.warning).toBeUndefined();
   });
 });

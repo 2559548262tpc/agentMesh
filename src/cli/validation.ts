@@ -5,6 +5,7 @@ import type { AgentRole, TransportMode } from "../agents/types.js";
 import type { AgentMeshProjectConfig, ConfigParseIssue } from "../core/config.js";
 import { findProjectConfigPath, parseProjectConfigText } from "../core/config.js";
 import type { MetricsAggregate, MetricsGroupStats, MetricsWindow } from "../core/metrics.js";
+import type { LeaderShareReport } from "../core/metrics.js";
 import type { ModelHealthEntry, ModelHealthSnapshot } from "../core/health.js";
 import type { GraduationProposal, ReviewerFindingsPrecision } from "../core/findings.js";
 
@@ -85,7 +86,10 @@ function renderMetricsGroupTable(title: string, groups: MetricsGroupStats[]): vo
 }
 
 /** Renders the `agentmesh stats` report; the full outcome breakdown lives in --json output. */
-export function renderMetricsReport(aggregate: MetricsAggregate): void {
+export function renderMetricsReport(
+  aggregate: MetricsAggregate,
+  options: { leaderShare?: LeaderShareReport } = {},
+): void {
   console.log(
     `\nAgentMesh Task Metrics (window: ${aggregate.window}, tasks: ${aggregate.taskCount})`,
   );
@@ -95,6 +99,15 @@ export function renderMetricsReport(aggregate: MetricsAggregate): void {
   }
   renderMetricsGroupTable("By model", aggregate.byModel);
   renderMetricsGroupTable("By role", aggregate.byRole);
+  renderMetricsGroupTable("By lane (v0.5 triage)", aggregate.byLane);
+  if (options.leaderShare && options.leaderShare.share !== undefined) {
+    const { leaderTokens, dispatchedTokens, share, warning } = options.leaderShare;
+    console.log(
+      `\nLeader share (v0.5): ${(share * 100).toFixed(1)}% ` +
+        `(leader ${leaderTokens} / dispatched ${dispatchedTokens} tokens)`,
+    );
+    if (warning) console.log(`WARNING: ${warning}`);
+  }
   if (aggregate.unattributedStallEvents > 0) {
     console.log(
       `\nNote: ${aggregate.unattributedStallEvents} stall event(s) could not be attributed to a dispatch record.`,

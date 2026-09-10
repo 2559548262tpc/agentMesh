@@ -104,6 +104,12 @@ export interface AgentResult {
    * failure could be classified with confidence; never fabricated.
    */
   errorCode?: ErrorCode;
+  /**
+   * HTTP status extracted from the vendor error payload when present
+   * (ISS-2): lets the orchestrator rule on quota/auth/retry without
+   * digging through raw vendor output. Never fabricated.
+   */
+  httpStatus?: number;
   /** Vendor-reported token usage for this turn when the transport exposes it. */
   usage?: UsageInfo;
   /** Non-fatal vendor diagnostics preserved alongside substantive output. */

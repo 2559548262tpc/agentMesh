@@ -10,13 +10,32 @@ import type {
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
 import { ARG_REJECTED, describeArgRejections, validateExtraArgs } from "../core/argPolicy.js";
+import { classifyErrorCode } from "../core/resilience.js";
 
 export interface ParsedOpenCodeOutput {
   output: string;
   sessionId?: string;
   error?: string;
   usage?: UsageInfo;
+  /**
+   * HTTP status extracted from the vendor error event (ISS-2), when the
+   * payload carries one explicitly. Never guessed from prose.
+   */
+  httpStatus?: number;
+  /**
+   * True when the stream parsed as JSONL events but produced zero text
+   * answers (P-081): the raw stdout is vendor event fragments, not an
+   * answer, so callers must not use it as output/summary fallback.
+   */
+  normalizedEmpty?: boolean;
 }
+
+/**
+ * P-081 placeholder replacing raw JSONL event fragments when the vendor run
+ * produced no text events. Observable via warning on the AgentResult.
+ */
+export const OPENCODE_NO_ANSWER_PLACEHOLDER =
+  "(no normalized answer produced: the vendor run emitted 0 text events)";
 
 function findStringField(value: unknown, keys: ReadonlySet<string>, depth = 0): string | undefined {
   if (!value || typeof value !== "object" || depth > 6) return undefined;
@@ -37,6 +56,7 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
   let error: string | undefined;
   let usage: UsageInfo | undefined;
   let parsedAny = false;
+  let parsedStatus: number | undefined;
 
   // step_finish tokens are per-step; sum across steps so multi-turn runs report
   // the whole turn. Non-finite or negative components are skipped rather than
@@ -112,6 +132,18 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
           }
           error = raw ? `${primary} | ${raw.slice(0, 400)}` : primary;
         }
+        // ISS-2: pull the explicit HTTP status out of the error payload
+        // (numeric status/code fields, or "HTTP 4xx"/"status: 403" text).
+        const errorText =
+          typeof event.error === "string" ? event.error : (JSON.stringify(event.error) ?? "");
+        const statusMatch =
+          /"(?:status|statusCode|httpStatus)"\s*:\s*(\d{3})\b/.exec(errorText) ??
+          /\bHTTP(?:\s+status)?\s*[:/]?\s*(\d{3})\b/i.exec(errorText) ??
+          /"\s*code\s*"\s*:\s*(\d{3})\b/.exec(errorText);
+        const statusValue = statusMatch ? Number.parseInt(statusMatch[1]!, 10) : undefined;
+        if (statusValue !== undefined && statusValue >= 400 && statusValue <= 599) {
+          parsedStatus = statusValue;
+        }
       }
     } catch {
       // Preserve compatibility with older/default output if a CLI emits mixed lines.
@@ -123,6 +155,8 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
     sessionId,
     error,
     usage,
+    ...(parsedStatus !== undefined ? { httpStatus: parsedStatus } : {}),
+    ...(parsedAny && answers.length === 0 ? { normalizedEmpty: true } : {}),
   };
 }
 
@@ -193,7 +227,14 @@ export class OpenCodeAdapter extends BaseAdapter {
       });
 
       const parsed = parseOpenCodeJsonLines(res.stdout);
-      const diagnosticOutput = [parsed.output || res.stdout, res.stderr]
+      // P-081: when the stream parsed as JSONL events but carried zero text
+      // answers, the raw stdout is vendor event fragments — never a usable
+      // answer or summary. Substitute the placeholder and disclose it.
+      const noTextEvents = parsed.normalizedEmpty === true;
+      const diagnosticOutput = [
+        parsed.output || (noTextEvents ? OPENCODE_NO_ANSWER_PLACEHOLDER : res.stdout),
+        res.stderr,
+      ]
         .filter(Boolean)
         .join("\n")
         .trim();
@@ -201,13 +242,27 @@ export class OpenCodeAdapter extends BaseAdapter {
         parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
       if (res.exitCode !== 0 || parsed.error) {
+        const failMessage = parsed.error ?? `OpenCode exited with code ${res.exitCode}`;
         return {
           status: "failed",
           agent: this.name,
           output: diagnosticOutput,
-          summary: parsed.error || `OpenCode exited with code ${res.exitCode}`,
+          summary: failMessage,
           error: parsed.error,
           exitCode: res.exitCode,
+          // ISS-2: machine-readable classification + HTTP status so the
+          // orchestrator can rule on quota/auth/retry without parsing raw
+          // vendor output. P-079①: the parsed status also feeds the
+          // classifier so bare "APIError" 5xx payloads still classify
+          // TRANSIENT and reach the resilient retry layer.
+          errorCode: classifyErrorCode({
+            message: failMessage,
+            exitCode: res.exitCode,
+            timedOut: res.timedOut,
+            aborted: res.aborted,
+            ...(parsed.httpStatus !== undefined ? { httpStatus: parsed.httpStatus } : {}),
+          }),
+          ...(parsed.httpStatus !== undefined ? { httpStatus: parsed.httpStatus } : {}),
           nativeSessionId,
           durationMs: Date.now() - startTime,
           timedOut: res.timedOut,
@@ -219,15 +274,30 @@ export class OpenCodeAdapter extends BaseAdapter {
         };
       }
 
-      return {
-        ...this.formatSuccessResult(parsed.output || diagnosticOutput, startTime, {
+      const successResult = this.formatSuccessResult(
+        noTextEvents ? OPENCODE_NO_ANSWER_PLACEHOLDER : parsed.output || diagnosticOutput,
+        startTime,
+        {
           nativeSessionId,
           exitCode: res.exitCode,
-          finalAnswer: parsed.output || undefined,
+          finalAnswer: noTextEvents ? undefined : parsed.output || undefined,
           role,
           reviewVerdictRequired: options.reviewVerdictRequired,
           resourceEvidence: res.resourceEvidence,
-        }),
+        },
+      );
+      return {
+        ...successResult,
+        ...(noTextEvents
+          ? {
+              warning: [
+                successResult.warning,
+                "The vendor produced no text events; the summary is a placeholder instead of raw JSONL event fragments (P-081).",
+              ]
+                .filter(Boolean)
+                .join(" "),
+            }
+          : {}),
         ...(parsed.usage ? { usage: parsed.usage } : {}),
       };
     } catch (err) {
@@ -238,6 +308,15 @@ export class OpenCodeAdapter extends BaseAdapter {
           output: [err.stdout, err.stderr].filter(Boolean).join("\n"),
           summary: `OpenCode execution error: ${err.message}`,
           exitCode: err.exitCode,
+          // ISS-7: TLS/certificate failures surface here as bare errors;
+          // classifying them TRANSIENT_5XX lets the resilient retry layer
+          // re-attempt instead of surfacing an unexplained failure.
+          errorCode: classifyErrorCode({
+            message: err.message,
+            exitCode: err.exitCode,
+            timedOut: err.timedOut,
+            aborted: err.aborted,
+          }),
           durationMs: Date.now() - startTime,
         };
       }

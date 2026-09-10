@@ -1,5 +1,6 @@
 import { Command, InvalidArgumentError } from "commander";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { defaultRunner } from "../core/runner.js";
 import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
@@ -8,7 +9,12 @@ import { startUiServer } from "../ui/server.js";
 import { VERSION } from "../version.js";
 import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
 import { runDoctorChecks } from "../core/diagnostics.js";
-import { aggregateTaskMetrics, readTaskMetrics } from "../core/metrics.js";
+import {
+  aggregateTaskMetrics,
+  readTaskMetrics,
+  computeLeaderShare,
+  sumDispatchedTokens,
+} from "../core/metrics.js";
 import type { MetricsWindow } from "../core/metrics.js";
 import { aggregateFindingsPrecision, proposeGraduations, readFindings } from "../core/findings.js";
 import { ModelHealthStore } from "../core/health.js";
@@ -20,6 +26,9 @@ import {
   WorkflowEngine,
 } from "../core/workflow.js";
 import type { WorkflowSnapshot } from "../core/workflow.js";
+import { parseRequirementsFile } from "../core/requirements.js";
+import { findUnknownRequirementIds } from "../core/ledger.js";
+import type { RequirementsFile } from "../core/requirements.js";
 import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
@@ -75,6 +84,7 @@ interface DoctorCommandOptions {
 interface StatsCommandOptions {
   findings?: boolean;
   json?: boolean;
+  leaderTokens?: number;
   minCount?: number;
   window?: MetricsWindow;
 }
@@ -444,6 +454,11 @@ program
   )
   .option("--window <window>", "Time window: all | 24h | 7d", parseStatsWindow, "all")
   .option(
+    "--leader-tokens <n>",
+    "Externally observed leader (host orchestrator) token consumption for the leaderShare metric (v0.5)",
+    parseStatsMinCount,
+  )
+  .option(
     "--findings",
     "Show reviewer findings precision and graduation proposals instead of task metrics",
     false,
@@ -469,11 +484,16 @@ program
         }
         return;
       }
-      const aggregate = aggregateTaskMetrics(readTaskMetrics(), { window: options.window });
+      const records = readTaskMetrics();
+      const aggregate = aggregateTaskMetrics(records, { window: options.window });
+      const leaderShare = computeLeaderShare({
+        leaderTokens: options.leaderTokens,
+        dispatchedTokens: sumDispatchedTokens(records),
+      });
       if (options.json) {
-        console.log(JSON.stringify(aggregate, null, 2));
+        console.log(JSON.stringify({ ...aggregate, leaderShare }, null, 2));
       } else {
-        renderMetricsReport(aggregate);
+        renderMetricsReport(aggregate, { leaderShare });
       }
     } catch (err) {
       console.error("Stats error:", err instanceof Error ? err.message : String(err));
@@ -521,6 +541,9 @@ program
 interface WorkflowRunCommandOptions {
   cwd: string;
   json?: boolean;
+  requirements?: string;
+  /** P-079②: workflow id of a previous terminal run to resume (skip passed stages). */
+  resume?: string;
 }
 
 interface WorkflowStatusCommandOptions {
@@ -551,6 +574,12 @@ function renderWorkflowTerminal(snapshot: WorkflowSnapshot): void {
   if (snapshot.evidence) {
     console.log(`Evidence:  [${snapshot.evidence.stageName}] ${snapshot.evidence.reason}`);
   }
+  if (snapshot.needsRulingIds && snapshot.needsRulingIds.length > 0) {
+    console.log(`Needs ruling (v0.5): ${snapshot.needsRulingIds.join(", ")}`);
+  }
+  if (snapshot.ledgerRef) {
+    console.log(`Ledger:    ${snapshot.ledgerRef}`);
+  }
   console.log(`----------------------------------------`);
 }
 
@@ -563,12 +592,20 @@ const workflowProgram = program
 workflowProgram
   .command("run <specPath>")
   .description(
-    "Run a workflow spec (JSON file matching the run_workflow schema) to its terminal state; exit code: 0 done, 1 failed, 2 escalated",
+    "Run a workflow spec (JSON file matching the run_workflow schema) to its terminal state; exit code: 0 done, 1 failed, 2 escalated, 3 needs_ruling (v0.5)",
   )
   .option(
     "-c, --cwd <path>",
     "Working directory for dispatches and acceptance commands",
     process.cwd(),
+  )
+  .option(
+    "--requirements <path>",
+    "v0.5 requirements.json path (EARS items with verbatim quotes) the terminal ledger reconciles against",
+  )
+  .option(
+    "--resume <workflowId>",
+    "P-079② checkpoint resume: resume a previous terminal run of the SAME spec name — already-passed stages are skipped and only pending stages re-run",
   )
   .option(
     "--json",
@@ -584,6 +621,48 @@ workflowProgram
         process.exitCode = 1;
         return;
       }
+      let requirements: RequirementsFile | undefined;
+      if (options.requirements) {
+        const requirementsPath = path.isAbsolute(options.requirements)
+          ? options.requirements
+          : path.resolve(options.cwd, options.requirements);
+        const parsedRequirements = parseRequirementsFile(
+          JSON.parse(fs.readFileSync(requirementsPath, "utf-8")),
+        );
+        if (!parsedRequirements.success || !parsedRequirements.requirements) {
+          console.error(`Invalid requirements file '${requirementsPath}':`);
+          for (const issue of parsedRequirements.issues) console.error(`  - ${issue}`);
+          process.exitCode = 1;
+          return;
+        }
+        requirements = parsedRequirements.requirements;
+        const unknownIds = findUnknownRequirementIds(parsed.spec, requirements);
+        if (unknownIds.length > 0) {
+          console.error("Spec declares requirement ids absent from the requirements set:");
+          for (const id of unknownIds) console.error(`  - ${id}`);
+          process.exitCode = 1;
+          return;
+        }
+      }
+      // P-079②: a --resume id must exist, be terminal, and carry the SAME
+      // spec name; already-passed stages are skipped by the engine.
+      let resumeSnapshot: WorkflowSnapshot | undefined;
+      if (options.resume) {
+        const prior = readPersistedWorkflowSnapshot(options.resume);
+        if (!prior) {
+          console.error(`No persisted workflow state found for '${options.resume}'.`);
+          process.exitCode = 1;
+          return;
+        }
+        if (prior.name !== parsed.spec.name) {
+          console.error(
+            `Cannot resume '${options.resume}': its spec name '${prior.name}' does not match this spec ('${parsed.spec.name}').`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        resumeSnapshot = prior;
+      }
       // Same default wiring the MCP server uses: the BackgroundDispatchService
       // provides registry persistence, the stalled watchdog and cancel support.
       const background = new BackgroundDispatchService();
@@ -593,6 +672,8 @@ workflowProgram
         background,
         cwd: options.cwd,
         candidateResolver: createDefaultCandidateResolver(defaultRunner, options.cwd),
+        ...(requirements ? { requirements } : {}),
+        ...(resumeSnapshot ? { resumeSnapshot } : {}),
         onUpdate: (snapshot) => {
           for (const stage of snapshot.stages) {
             if (reported.get(stage.index) === stage.status) continue;
@@ -608,7 +689,8 @@ workflowProgram
       if (options.json) console.log(JSON.stringify(snapshot, null, 2));
       else renderWorkflowTerminal(snapshot);
       if (snapshot.status !== "done") {
-        process.exitCode = snapshot.status === "escalated" ? 2 : 1;
+        process.exitCode =
+          snapshot.status === "escalated" ? 2 : snapshot.status === "needs_ruling" ? 3 : 1;
       }
     } catch (err) {
       console.error("Workflow error:", err instanceof Error ? err.message : String(err));

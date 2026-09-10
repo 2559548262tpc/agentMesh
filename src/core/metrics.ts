@@ -14,6 +14,16 @@ import { defaultStorage, homeMetricsFilePath, resolveAgentMeshHome } from "./sto
 export type TaskMetricsOutcome = "ok" | "error" | "stalled" | "cancelled" | "timeout";
 
 /**
+ * v0.5 dispatch lane (design §5): `fast` (acceptance-as-review + sampling),
+ * `standard` (worker + reviewer + rework), `gated` (pre-run leader ruling
+ * gate), `full` (whole pipeline with R-tagged findings). Assigned by the
+ * Batch 2 triage engine; records without a lane group under "unknown".
+ */
+export type WorkflowLane = "fast" | "standard" | "gated" | "full";
+
+const WORKFLOW_LANES: readonly WorkflowLane[] = ["fast", "standard", "gated", "full"];
+
+/**
  * Per-dispatch metrics record. `role`/`agent`/`model` are optional because a
  * watchdog stall line is emitted before the dispatch result is known; absent
  * values are grouped under "unknown" instead of being fabricated.
@@ -27,6 +37,8 @@ export interface TaskMetrics {
   agent?: string;
   /** Effective requested model (explicit override or project-config default). */
   model?: string;
+  /** v0.5 triage lane assigned by the Batch 2 triage engine (absent → unknown). */
+  lane?: WorkflowLane;
   tokensIn: number;
   tokensOut: number;
   durationMs: number;
@@ -72,6 +84,8 @@ export interface MetricsAggregate {
   unattributedStallEvents: number;
   byModel: MetricsGroupStats[];
   byRole: MetricsGroupStats[];
+  /** v0.5: dispatch aggregation by triage lane ("unknown" until Batch 2 assigns lanes). */
+  byLane: MetricsGroupStats[];
 }
 
 const WINDOW_MS: Record<Exclude<MetricsWindow, "all">, number> = {
@@ -149,12 +163,15 @@ function parseTaskMetricsLine(line: string): TaskMetrics | undefined {
     if (!startedAt || !endedAt) return undefined;
     const parsedRole = AGENT_ROLES.find((candidateRole) => candidateRole === candidate.role);
     if (candidate.role !== undefined && !parsedRole) return undefined;
+    const parsedLane = WORKFLOW_LANES.find((candidateLane) => candidateLane === candidate.lane);
+    if (candidate.lane !== undefined && !parsedLane) return undefined;
     return {
       taskId: optionalString(candidate.taskId),
       sessionId: optionalString(candidate.sessionId),
       role: parsedRole,
       agent: optionalString(candidate.agent),
       model: optionalString(candidate.model),
+      ...(parsedLane ? { lane: parsedLane } : {}),
       tokensIn: nonNegativeNumber(candidate.tokensIn),
       tokensOut: nonNegativeNumber(candidate.tokensOut),
       durationMs: nonNegativeNumber(candidate.durationMs),
@@ -318,6 +335,7 @@ export function aggregateTaskMetrics(
     stallEventsByTaskId,
   );
   const byRole = buildGroups(dispatches, (record) => record.role ?? "unknown", stallEventsByTaskId);
+  const byLane = buildGroups(dispatches, (record) => record.lane ?? "unknown", stallEventsByTaskId);
 
   let unattributedStallEvents = standaloneStallEvents;
   for (const [taskId, events] of stallEventsByTaskId) {
@@ -332,5 +350,66 @@ export function aggregateTaskMetrics(
     unattributedStallEvents,
     byModel,
     byRole,
+    byLane,
   };
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 leaderShare (design §2 度量先行 / P-080④)
+// ---------------------------------------------------------------------------
+
+/** Fraction of total project tokens above which the leader share warns (design: >25%). */
+export const LEADER_SHARE_WARN_THRESHOLD = 0.25;
+
+export interface LeaderShareReport {
+  /**
+   * Leader (host orchestrator) token consumption, externally observed —
+   * AgentMesh cannot meter the host LLM itself; the number arrives through
+   * `agentmesh stats --leader-tokens` (host UI) per the evidence-honesty
+   * principle: never fabricated, absent → share undefined.
+   */
+  leaderTokens: number;
+  /** AgentMesh-metered dispatch consumption (Σ tokensIn + tokensOut). */
+  dispatchedTokens: number;
+  /** leader / (leader + dispatched); undefined without a positive denominator. */
+  share?: number;
+  /** Set when share exceeds LEADER_SHARE_WARN_THRESHOLD. */
+  warning?: string;
+}
+
+/** Sums AgentMesh-metered dispatch tokens (leader consumption excluded by construction). */
+export function sumDispatchedTokens(records: readonly TaskMetrics[]): number {
+  let total = 0;
+  for (const record of records) {
+    if (record.outcome === "stalled") continue;
+    total += record.tokensIn + record.tokensOut;
+  }
+  return total;
+}
+
+/**
+ * Derives the leader share (P-080④). Honest-boundary note: the leader's host
+ * tokens must be supplied by the caller; this function only does the math and
+ * the threshold warning — it never estimates or invents the leader side.
+ */
+export function computeLeaderShare(params: {
+  leaderTokens?: number;
+  dispatchedTokens: number;
+}): LeaderShareReport {
+  const leaderTokens = params.leaderTokens ?? 0;
+  const denominator = leaderTokens + params.dispatchedTokens;
+  if (denominator <= 0) return { leaderTokens, dispatchedTokens: params.dispatchedTokens };
+  const share = leaderTokens / denominator;
+  const report: LeaderShareReport = {
+    leaderTokens,
+    dispatchedTokens: params.dispatchedTokens,
+    share,
+  };
+  if (share > LEADER_SHARE_WARN_THRESHOLD) {
+    report.warning =
+      `LEADER_SHARE_EXCEEDED: leader consumption is ${(share * 100).toFixed(1)}% of total ` +
+      `project tokens (threshold ${LEADER_SHARE_WARN_THRESHOLD * 100}%). Route inspection/` +
+      `long-output reading to free-tier reviewers and rely on compact returns (P-080).`;
+  }
+  return report;
 }

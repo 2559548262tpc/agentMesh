@@ -126,6 +126,20 @@ export function homeContextsDirectory(homeDir: string): string {
   return path.join(homeDir, "contexts");
 }
 
+/**
+ * v0.5 pointerized outputs (design §4.4/§6 Tier 0): terminal reconciliation
+ * ledgers and oversized MCP returns land here instead of the project working
+ * tree — writing into project cwd would dirty repositories under test.
+ */
+export function homeOutDirectory(homeDir: string): string {
+  return path.join(homeDir, "out");
+}
+
+/** Terminal reconciliation ledger path for one workflow. */
+export function ledgerFilePath(homeDir: string, workflowId: string): string {
+  return path.join(homeOutDirectory(homeDir), `ledger_${workflowId}.json`);
+}
+
 // ---------------------------------------------------------------------------
 // Home resolution (absorbed from session.ts; re-exported there for compat).
 // ---------------------------------------------------------------------------

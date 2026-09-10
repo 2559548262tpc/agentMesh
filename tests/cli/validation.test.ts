@@ -122,6 +122,7 @@ describe("cli/stats", () => {
         outcomes: { ok: 2, error: 1, stalled: 0, cancelled: 0, timeout: 0 },
       },
     ],
+    byLane: [],
   };
 
   it("renders per-model and per-role tables with rates and the stall attribution note", () => {
@@ -152,6 +153,7 @@ describe("cli/stats", () => {
         unattributedStallEvents: 0,
         byModel: [],
         byRole: [],
+        byLane: [],
       });
       const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
       expect(output).toContain("No task metrics recorded yet.");

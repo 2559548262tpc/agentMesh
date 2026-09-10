@@ -261,7 +261,8 @@ agentmesh capabilities show
    - **队列与依赖 DAG（M7b）**：设置环境变量 `AGENTMESH_MAX_CONCURRENT_BACKGROUND_TASKS`（正整数，按 bridge 进程生效；缺省不设上限）后，达到并发上限的派发进入持久化队列（`registry.jsonl` 记录队列标记，bridge 重启后可还原队列状态），返回 `Status: QUEUED (waiting for a free concurrency slot)`。`deps` 声明依赖 DAG：所列任务必须先到达终态 SUCCESS 本任务才会启动；自引用/未知 ID 被 `DEP_SELF`/`DEP_UNKNOWN` 结构化拒绝，依赖已终态失败时本任务立即以 `DEP_FAILED` 失败（不执行）。等待期间返回 `Status: QUEUED (blocked by deps: ...)`。队列按 `(priority, 入队时间)` 排序排水：priority 数值小者先跑（默认 0），同步派发与无上限、无依赖的后台派发行为与 M7b 之前完全一致（priority/deps 被忽略，零回归）。
 2. **`poll_task`**
    - 观察一个后台 delegate_task：返回 `status` (`running` | `queued` | `blocked` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore`以及终态时的 `result`。`queued`/`blocked`（M7b）表示派发已注册但被并发上限或未满足依赖扣在队列里，此时附带 `queuePosition`（队列中的 1-based 排位）与 `blockedBy`（尚未 SUCCESS 的依赖 ID 列表，仅 `blocked`）；长轮询会一直等到排队任务真正启动或终态（排队→运行的事件唤醒）。
-   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取), `maxWaitMs` (可选，0-60000，长轮询预算：调用在事件驱动下阻塞直到有新输出或终态，到达上限才返回；推荐 30000，省略则为快速非阻塞状态查询)。
+   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取), `maxWaitMs` (可选，0-60000，长轮询预算：调用在事件驱动下阻塞直到有新输出或终态，到达上限才返回；推荐 30000，省略则为快速非阻塞状态查询), `detail` (可选，v0.5: `compact` 默认 | `full`)。
+   - **v0.5 compact 默认（P-080①）**：默认返回有界封套——状态、`nextOffset`、至多最后 1.5KB 的新增输出（`outputTail`，附 `outputTailOmittedChars` 计数）与 `outputFile` 指针；磁盘上的任务输出文件始终是完整逐字记录，不丢信息，只是不进组长上下文。需要逐字增量输出时显式传 `detail: "full"`（v0.4 行为）。
    - **事件驱动长轮询**：任务注册表持有进程内类型化事件总线（`task.started` / `task.output` / `task.completed` / `task.stalled`），长轮询调用在任务活动（事件或输出文件变化）时立即唤醒，而不是固定 100ms 盲轮询；预算上限仍然硬性约束墙钟时间。未指定 `maxWaitMs` 时单次调用内部最多阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
    - **Best-effort 通知**：后台任务达到终态或被标记 stalled 时，MCP Server 会通过标准 `notifications/message`（logging 能力）向宿主推送一条提示（附 taskId 与下一步 poll 指引）。通知不保证送达——不支持或不上浮 logging 消息的宿主会静默忽略；可靠的观察机制始终是长轮询 `poll_task`。
 3. **`cancel_task`**
@@ -297,14 +298,19 @@ agentmesh capabilities show
 
 11. **`run_workflow`**
     - 把一份声明式 JSON spec 交给进程内**确定性编排状态机**（M4）执行：每个 stage 派发 agent（worker/reviewer/tester 角色或 `parallelGroups` 并行包），执行验收命令 + 必需文件检查；reviewer stage 的 FAIL 会把结构化 findings 注入原 worker 会话（`continue_task`）并复审，直到 PASS 或轮次耗尽。流转全程无 LLM 参与；stage 派发走与 `delegate_task(background:true)` 相同的后台任务路径（registry 持久化、stalled 看门狗、`cancel_task` 全部继承），等待全事件驱动。
-    - 参数：`spec` (必填), `cwd` (可选，stage 派发与验收命令的目标目录)。spec：`name` + `stages[]`；每个 stage 声明 `roles` 或 `parallelGroups`（二选一）与 `dispatch`（`agent`、`mode`、`taskTemplate` 支持 `{{workflowName}}`/`{{stageName}}`/`{{group}}`/`{{upstreamSummaries}}` 占位符，`contextPolicy.contextSessionIds: "upstream"` 或显式数组 ≤4，`timeoutMs`），可选 `acceptance`（`commands[]` 顺序执行于 cwd，exit 0 = 通过；`files[]` 必须存在）与 `policy`（`maxReworkRounds` 0-3、`escalateOn: reviewFail|acceptanceFail|any`、`reRouteOnStall`，见下文"确定性编排状态机"）。
-    - 终态：`done`（全部 stage 通过）/ `escalated`（命中 `escalateOn` 的失败类——快照携带完整证据链：逐轮 findings、验收命令输出、仓库 diff 摘要；这是唯一回到 LLM Orchestrator/人类的点）/ `failed`（其余失败）。调用立即异步返回 `{workflowId}`，用 `get_workflow` 观察。
+    - 参数：`spec` (必填), `cwd` (可选，stage 派发与验收命令的目标目录), `requirementsPath` (可选，v0.5)。spec：`name` + `stages[]`；每个 stage 声明 `roles` 或 `parallelGroups`（二选一）、可选 `requirements: ["R1",…]`（本 stage 实现的需求 id）与 `dispatch`（`agent`、`mode`、`taskTemplate` 支持 `{{workflowName}}`/`{{stageName}}`/`{{group}}`/`{{upstreamSummaries}}` 占位符，`contextPolicy.contextSessionIds: "upstream"` 或显式数组 ≤4，`timeoutMs`），可选 `acceptance`（`commands[]` 顺序执行于 cwd，exit 0 = 通过，每条命令可为旧字符串或 v0.5 的 `{cmd, covers: ["R1",…]}` 需求覆盖声明；`files[]` 必须存在，同时是分诊规模信号与越界写检出参照集）与 `policy`（`maxReworkRounds` 0-3、`escalateOn: reviewFail|acceptanceFail|any`、`reRouteOnStall`，见下文"确定性编排状态机"）。
+    - **v0.5 需求对账（`requirementsPath`）**：传入 requirements.json（EARS 五模式句式 + `quote` 原文引用 + `decidable` 标记；格式见下文"需求对账单"）。引擎在 run 前做 fail-closed 校验：schema、`quote` 必须是源文档真实子串（机械核验，防蒸馏/手写编造出处）、spec 声明的每个 R id 必须存在于需求集。终态引擎 join 出对账单 ledger 落盘 `<agentmeshHome>/out/ledger_<workflowId>.json` 并对会话做 Tier 1 规则化归档。
+    - 终态：`done`（全部 stage 通过且无未裁决行）/ `needs_ruling`（v0.5：stage 全通过但 ledger 存在 PENDING_RULING 行——裁决后引擎重出 ledger 闭环）/ `escalated`（命中 `escalateOn` 的失败类——快照携带完整证据链：逐轮 findings、验收命令输出、仓库 diff 摘要；这是唯一回到 LLM Orchestrator/人类的点）/ `failed`（其余失败）。调用立即异步返回 `{workflowId}`，用 `get_workflow` 观察。
 12. **`get_workflow`**
-    - 返回工作流当前快照：总体状态、逐 stage 状态迁移、派发任务记录（stage 任务 ID 形如 `<workflowId>_s<stage>_<seq>`，可被 `poll_task`/`cancel_task` 直接观察）、验收命令结果、逐轮评审 verdict 与 findings、终态完整证据链。
-    - 参数：`workflowId` (必填), `maxWaitMs` (可选，0-60000 事件驱动长轮询，推荐 30000)。本进程持有的活跃工作流支持长轮询；其他（含已结束 bridge 进程启动的）工作流从持久化的 workflows.jsonl 日志读取最后一份快照（追加式 JSONL，损坏行跳过 fail-closed）。
+    - 返回工作流状态：**v0.5 默认 compact 封套（P-080①）**——`workflowId`/`status`/逐 stage 状态表 + flag 位（`unresolvedP0P1` 未解决 P0/P1 findings 计数、`coverage` 需求覆盖串如 `8/9（1 PENDING_RULING）`、`anomalies` 终态异常）+ `ledgerRef` 对账单指针；`detail: "full"` 显式返回完整快照（总体状态、逐 stage 状态迁移、派发任务记录——stage 任务 ID 形如 `<workflowId>_s<stage>_<seq>`，可被 `poll_task`/`cancel_task` 直接观察——、验收命令结果、逐轮评审 verdict 与 findings、终态完整证据链）。两种模式的返回体都遵守 Tier 0：超过 2KB 自动落盘 `<agentmeshHome>/out/` 只回尾部 1.5KB + 路径（P-080②）。
+    - 参数：`workflowId` (必填), `maxWaitMs` (可选，0-60000 事件驱动长轮询，推荐 30000), `detail` (可选，v0.5: `compact` 默认 | `full`)。本进程持有的活跃工作流支持长轮询；其他（含已结束 bridge 进程启动的）工作流从持久化的 workflows.jsonl 日志读取最后一份快照（追加式 JSONL，损坏行跳过 fail-closed）。
 13. **`handoff_diff`**
     - 交接保真度的机器判定（v0.4 M7）：传入 `upstreamSessionId` 与 `downstreamSessionId`（均为 Bridge session id），对比上游会话实际产出（task、summary、finalAnswer、findings、仓库证据）与下游派发实际接收到的注入内容，返回损失等级——`lossless | minor-truncation | partial-loss | severe-loss | lost`——附逐节判定（`missingKeys`/`truncatedKeys`/`preservedSections`）与下游会话每次上下文注入的完整清单。
     - 判定优先使用逐字记录的注入内容（shared-context audit sidecar），不可读时降级为审计元数据；被分析注入的 STALE 新鲜度会把无损结果降级。用它替代人工比对会话历史来判断交接是否损失信息。
+14. **`verify_contract_map`**
+    - 机器核验 worker 交付的契约映射（契约项 id → file:line），零 LLM token：每个被映射文件必须存在可读、行号在界内且非空。用作深度 LLM 评审前的快速评审闸；`pass:false` 报告逐项给出失败状态（`missing` | `out-of-bounds` | `empty` | `unknown-item`），worker 可直接修复映射而无需一轮评审。
+    - 参数：`contractItems` (必填，契约清单 {id, text}), `map` (必填，worker 交付的 {id, file, line} 数组), `requirementIds` (可选，v0.5), `cwd` (可选，相对路径解析基准)。
+    - **v0.5 按 R 申报**：契约项可直接使用需求 id（R1..Rn）；传入 `requirementIds` 时每个 R id 成为必映射项——worker 映射缺失该 R 记 `missing`，映射了未声明 id 记 `unknown-item`，整体 `pass:false`。
 
 ### 配置到 MCP 客户端
 
@@ -370,13 +376,73 @@ r21/r22 真实测试轮实证：编排循环（拆解 → 派发 → 收结果 �
 ```
 
 - **stage 形态**：`roles`（单派发，首项为执行角色）或 `parallelGroups`（互斥文件集并行包，每名一个并发派发，`{{group}}` 替换进 taskTemplate）二选一；`dispatch.contextPolicy.contextSessionIds: "upstream"` 把前序 stage 的 Bridge Session 一手注入本 stage。
-- **状态机**：每个 stage 走 `pending → dispatched → running → acceptance → review →（PASS → 下一 stage；FAIL → rework 环）`；终态 `done` / `escalated` / `failed`。
+- **状态机**：每个 stage 走 `pending → dispatched → running → acceptance → review →（PASS → 下一 stage；FAIL → rework 环）`；终态 `done` / `needs_ruling`（v0.5）/ `escalated` / `failed`。
 - **验收即代码**："done 的定义"从纪律变成引擎行为：`acceptance.commands`（exit 0 = 通过）与 `acceptance.files`（必须存在）由引擎直接执行，验收失败即按 `escalateOn` 分级终止并附命令 stdout/stderr 证据。
 - **rework 环（fail-closed）**：reviewer stage 的 FAIL findings 由引擎通过 `continue_task` 注入原 worker 会话，修复后以 `review_changes` 严格契约复审；无 verdict（UNKNOWN）不放行。轮次耗尽仍 FAIL → `escalated`（唯一回到 LLM Orchestrator/人类的点），快照携带逐轮 findings 与修复结果。
 - **继承后台任务基建**：stage 派发是货真价实的后台任务——registry 持久化、stalled 看门狗（30 分钟无输出自动终止 + checkpoint 溢出）、`cancel_task`、`poll_task` 增量输出全部可用，任务 ID 形如 `<workflowId>_s<stage>_<seq>`。stall 类失败且 `policy.reRouteOnStall` 时按 M2 健康度候选链重派。
 - **事件驱动**：引擎等待全部基于事件总线与输出文件变化唤醒，零固定间隔轮询；`get_workflow` 的 `maxWaitMs` 提供事件驱动长轮询。
 - **持久化**：每次状态更新追加一行快照到 `<agentmeshHome>/workflows.jsonl`（同 metrics.jsonl 约定，最后一行为准，损坏行跳过 fail-closed）；`agentmesh workflow status <workflowId>` 可跨进程读取。
-- **CLI**：`agentmesh workflow run <spec.json>` 跑到终态（退出码 0/1/2 = done/failed/escalated），`--json` 时进度走 stderr、终态快照走 stdout。
+- **CLI**：`agentmesh workflow run <spec.json> [--requirements requirements.json]` 跑到终态（退出码 0/1/2/3 = done/failed/escalated/needs_ruling），`--json` 时进度走 stderr、终态快照走 stdout。
+
+### 需求对账单与组长节流（v0.5 Batch 1）
+
+设计文档：`v0.5_设计_需求对账单架构.md`。三目标——token 少（返回形态层）、精度可证（需求 ID 贯穿）、简单任务快（分诊路由，Batch 2）——Batch 1 先落"尺子"与对账单核心：
+
+**requirements.json（EARS + 引用 + 可判定标记）**
+
+```json
+{
+  "source": "需求文档 v3.md",
+  "items": [
+    {
+      "id": "R3",
+      "ears": "WHEN 借阅数 > 当前库存 THEN 系统 SHALL 返回 400 AND 不修改库存",
+      "kind": "event-driven",
+      "quote": "库存不足时不能借出（§2.1）",
+      "decidable": true
+    },
+    { "id": "R9", "ears": null, "kind": null, "quote": "列表页要美观大方", "decidable": false }
+  ]
+}
+```
+
+- `quote` 必须是 `source` 文档的真实子串——引擎在 run 前机械核验（零 token），蒸馏或手写条目编造出处会被 `QUOTE_VERIFICATION_FAILED` 结构化拒绝。该核验只证明**出处**，不证明 EARS 改写忠实；忠实度由组长抽查与抽检逃逸率单独度量。
+- `decidable: false` 的条目（EARS 表达不了的主观需求）进人审区：声明进 workflow 后其 ledger 行为 `PENDING_RULING`，终态翻转为 `needs_ruling` 而非 `done`——快车道不得携带未裁决条目安静完成。
+- 对数粗核验（warning 级）：条目数超过源文档的结构单元（章节 + 列表项）总数时提示可能的合并/编造。
+
+**WorkflowSpec 需求贯穿**：stage 声明 `requirements: ["R1","R2"]`，验收命令用 `{cmd, covers: ["R1"]}` 声明覆盖关系。终态时引擎 join 出**对账单 ledger**（`<agentmeshHome>/out/ledger_<workflowId>.json`）：
+
+```json
+{
+  "workflowId": "wf_xxx",
+  "rows": [
+    {
+      "id": "R3",
+      "ears": "WHEN … THEN … SHALL …",
+      "quote": "…",
+      "status": "PASS",
+      "evidence": {
+        "commands": [
+          { "cmd": "node --test borrow.test.mjs", "exitCode": 0, "covers": ["R3"], "ok": true }
+        ],
+        "contractMap": [],
+        "findings": []
+      }
+    }
+  ],
+  "invariant": { "requirements": 9, "rows": 9, "ok": true }
+}
+```
+
+- 行状态语义（fail-closed）：PASS 要求每个声明该 R 的 stage 都通过**且**至少一条 covering 验收命令 exit 0；stage 通过但无 covering 证据 → `PENDING_RULING`（不静默放行）；declaring stage 失败/升级 → 行状态随之 `FAIL`/`ESCALATED`（跨 stage 合取）。未被任何 stage 声明的 R 同样落 `PENDING_RULING`——不丢账。
+- 对数硬不变量独立复算：`n(requirements) == Σn(行状态)`，不等即告警（fail-closed，静默丢失结构性禁止）。
+- 组长裁决闭环：`needs_ruling` 终态下组长裁决 PENDING_RULING 行（改写 EARS 或显式豁免）后重跑 ledger close-out；CLI 退出码 3 标识该终态。
+
+**返回形态层（P-080①②）**：`get_workflow`/`poll_task` 默认 compact 封套（flag 位：`unresolvedP0P1`/`coverage`/`anomalies`；poll 只回 ≤1.5KB 增量尾部 + 输出文件指针），`detail: "full"` 显式取全量；Tier 0 无条件生效——**任何**面向组长的返回体 >2KB 自动落盘 `<agentmeshHome>/out/` 只回尾部 + 路径，大输出从未进入组长上下文。
+
+**Tier 1 规则化清场（仅 AgentMesh 侧会话）**：workflow 终态时，该 workflow 产出的 Bridge 会话历史中 task 回显与 finalAnswer 原文替换为占位符 `[archived → <ledgerRef>]`，仅"最近一个 stage"的会话保留最新一轮完整原文；summary/findings/usage 保留供 `contextSessionIds` 复用。零 token、确定性。硬边界：宿主侧组长历史引擎不可改写，组长侧防护靠 Tier 0 事前截断（组长会话内已存在的历史请用新开会话 + contextSessionIds 续接消化）。
+
+**度量先行（P-080④）**：`agentmesh stats [--leader-tokens <n>]` 在按 model/role 聚合之外增加 **by lane** 聚合（fast/standard/gated/full，Batch 2 分诊填充；未标注记 unknown）与 **leaderShare** 派生指标——组长消耗（由宿主 UI 读数后经 `--leader-tokens` 提供，引擎不 meter 宿主、绝不伪造）占项目总消耗比例，超 25% 输出 `LEADER_SHARE_EXCEEDED` 告警。`TaskMetrics` 记录增 `lane` 字段供 Batch 2 分诊直接写入。
 
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容按 **T2.4 分段限额**控制：共享轮次内的任务描述回显每轮 ≤4000 字符、上游结论总量 ≤12000 字符（多来源均分）、环境快照 ≤2k 字符（超限截断并附 "run git status for full detail" 补救指令），三段独立计费互不挤占（总预算 24k，剩余 ~6k 为下游留白），所有截断都显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 

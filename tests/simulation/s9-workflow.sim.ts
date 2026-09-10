@@ -85,7 +85,7 @@ describe("S9 workflow: the deterministic state machine drives real fake-vendor s
   async function awaitTerminalWorkflow(workflowId: string): Promise<WorkflowPayload> {
     let payload: WorkflowPayload = {};
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      const res = await callJson("get_workflow", { workflowId, maxWaitMs: 5_000 });
+      const res = await callJson("get_workflow", { workflowId, maxWaitMs: 5_000, detail: "full" });
       payload = res.payload;
       if (payload.status !== "running") return payload;
     }
@@ -165,9 +165,14 @@ describe("S9 workflow: the deterministic state machine drives real fake-vendor s
     expect(stringField(task, "sessionId")).toBeDefined();
     expect(stage?.sessionIds).toHaveLength(1);
 
-    // poll_task sees the stage task like any background dispatch: terminal
-    // result plus the tee'd vendor output (heartbeats prove incremental tee).
-    const pollRes = await callJson("poll_task", { taskId: stageTaskId, maxWaitMs: 5_000 });
+    // poll_task sees the stage task like any background dispatch: the compact
+    // envelope (v0.5 default) carries the terminal status; the full detail
+    // mode exposes the tee'd vendor output (heartbeats prove incremental tee).
+    const pollRes = await callJson("poll_task", {
+      taskId: stageTaskId,
+      maxWaitMs: 5_000,
+      detail: "full",
+    });
     const poll = pollRes.payload as TaskPayload;
     expect(poll.status).toBe("completed");
     expect(stringField(poll.result, "finalAnswer")).toContain("DONE:");

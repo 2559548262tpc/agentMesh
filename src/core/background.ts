@@ -55,6 +55,15 @@ export const POLL_INTERVAL_MS = 100;
 /** Upper bound a single poll_task call may spend waiting for progress. */
 export const POLL_MAX_WAIT_MS = 500;
 
+/**
+ * ISS-5 hard cap on any poll_task long-poll budget: a caller-requested
+ * maxWaitMs beyond this ceiling previously blocked past MCP client timeouts
+ * (`-32001 Request timed out`), defeating the long-poll contract. The cap
+ * stays safely under the common 30s host/MCP window; callers wanting a longer
+ * horizon loop poll_task calls instead of one oversized block.
+ */
+export const POLL_MAX_WAIT_CAP_MS = 25_000;
+
 /** Cap for one incremental output read (mirrors [CC] DEFAULT_MAX_READ_BYTES). */
 export const MAX_POLL_READ_BYTES = 8 * 1024 * 1024;
 
@@ -916,7 +925,24 @@ export class BackgroundTaskRegistry {
   /** One poll step: status resolution plus incremental output read. */
   public async pollOnce(taskId: string, sinceOffset: number): Promise<PollTaskOutcome> {
     const record = this.getRegisteredTask(taskId);
-    if (!record) throw new BackgroundTaskNotFoundError(taskId);
+    if (!record) {
+      // ISS-6: a reaped/expired registry line must not orphan a persisted
+      // terminal result. The result file survives registry rewrites (reaping
+      // only drops the record), so poll_task returns the terminal outcome
+      // instead of a bare NOT_FOUND when the files are still on disk.
+      const persisted = await this.readStoredResult(taskId);
+      if (persisted) {
+        return {
+          taskId,
+          status: persisted.status,
+          outputSinceOffset: "",
+          nextOffset: Math.max(0, sinceOffset),
+          hasMore: false,
+          result: persisted,
+        };
+      }
+      throw new BackgroundTaskNotFoundError(taskId);
+    }
     const stored = await this.readStoredResult(taskId);
     const read = await readOutputRange(
       record.outputFile,
@@ -993,7 +1019,9 @@ export class BackgroundTaskRegistry {
    */
   public async pollTask(options: PollTaskOptions): Promise<PollTaskOutcome> {
     const intervalMs = options.intervalMs ?? POLL_INTERVAL_MS;
-    const maxWaitMs = options.maxWaitMs ?? POLL_MAX_WAIT_MS;
+    // ISS-5: the effective budget is capped so a long-poll call can never
+    // outlive the MCP client's own request timeout.
+    const maxWaitMs = Math.min(options.maxWaitMs ?? POLL_MAX_WAIT_MS, POLL_MAX_WAIT_CAP_MS);
     const sleep = options.sleep ?? defaultSleep;
     // The wait budget is wall-clock bounded on purpose: the injectable logical
     // clock drives status decisions and must never stretch a caller's poll.

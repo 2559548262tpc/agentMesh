@@ -28,7 +28,15 @@ import type { HealthWeightedCandidate } from "./health.js";
 import type { ErrorCode } from "./types.js";
 import type { BackgroundDispatchService } from "../mcp/tools.js";
 import type { StoredTaskResult } from "./background.js";
-import { defaultStorage, homeWorkflowsFilePath, resolveAgentMeshHome } from "./storage.js";
+import {
+  defaultStorage,
+  homeWorkflowsFilePath,
+  ledgerFilePath,
+  resolveAgentMeshHome,
+} from "./storage.js";
+import type { RequirementsFile } from "./requirements.js";
+import { buildLedger, needsRuling, pendingRulingIds } from "./ledger.js";
+import type { AgentMeshEventBus } from "./events.js";
 
 /**
  * M4 deterministic orchestration state machine (ROADMAP_v0.4 M4).
@@ -110,19 +118,42 @@ const StageDispatchSpecSchema = z
   })
   .strict();
 
+/** Acceptance command: legacy plain string or the v0.5 object with requirement coverage. */
+const StageAcceptanceCommandSchema = z.union([
+  z.string().trim().min(1).max(4_000),
+  z
+    .object({
+      cmd: z.string().trim().min(1).max(4_000),
+      covers: z
+        .array(z.string().trim().min(1).max(64))
+        .min(1)
+        .max(64)
+        .optional()
+        .describe("Requirement ids (e.g. R1, R3) this command proves — feeds the terminal ledger"),
+    })
+    .strict(),
+]);
+
 const StageAcceptanceSpecSchema = z
   .object({
     commands: z
-      .array(z.string().trim().min(1).max(4_000))
+      .array(StageAcceptanceCommandSchema)
       .min(1)
       .max(10)
-      .describe("Shell commands executed sequentially in the target cwd; exit code 0 = pass"),
+      .describe(
+        "Shell commands executed sequentially in the target cwd; exit code 0 = pass. " +
+          "Each entry is either a plain command string or {cmd, covers:[R...]} declaring " +
+          "which requirement ids the command proves (v0.5 reconciliation)",
+      ),
     files: z
       .array(z.string().trim().min(1).max(1_000))
       .min(1)
       .max(50)
       .optional()
-      .describe("Repo-relative paths that must exist after the stage completes"),
+      .describe(
+        "Declared file set: repo-relative paths that must exist after the stage completes. " +
+          "Doubles as the lane-triage size signal and the out-of-scope write reference set (v0.5)",
+      ),
     timeoutMs: z
       .number()
       .int()
@@ -181,6 +212,22 @@ const StageSpecSchema = z
         "Mutually-exclusive parallel package names: one concurrent dispatch per name " +
           "(role defaults to worker); {{group}} substitutes the package name in the taskTemplate",
       ),
+    /** Requirement ids (R1..Rn) this stage implements — threads requirements through the ledger. */
+    requirements: z
+      .array(
+        z
+          .string()
+          .trim()
+          .regex(/^R\d+$/, "requirement id must match R<number>"),
+      )
+      .min(1)
+      .max(64)
+      .optional()
+      .describe(
+        "Requirement ids this stage implements; every id must exist in the run's requirements set. " +
+          "A stage-declared id without covering acceptance command evidence yields a " +
+          "PENDING_RULING ledger row (fail-closed)",
+      ),
     dispatch: StageDispatchSpecSchema,
     acceptance: StageAcceptanceSpecSchema.optional(),
     policy: StagePolicySpecSchema.optional(),
@@ -201,7 +248,13 @@ export type WorkflowStagePolicy = z.infer<typeof StagePolicySpecSchema>;
 /** Normalized stage policy after the engine applies its documented defaults. */
 type ResolvedStagePolicy = Required<WorkflowStagePolicy>;
 
-export type WorkflowOverallStatus = "running" | "done" | "escalated" | "failed";
+/**
+ * Terminal workflow status. `needs_ruling` (v0.5) means every stage passed but
+ * the reconciliation ledger carries PENDING_RULING rows — the fast lane must
+ * not finish quietly with unruled items; the leader rules them and the engine
+ * re-emits the ledger to close out as done.
+ */
+export type WorkflowOverallStatus = "running" | "done" | "needs_ruling" | "escalated" | "failed";
 
 export type WorkflowStageStatus =
   | "pending"
@@ -240,6 +293,8 @@ export interface WorkflowAcceptanceCommandRecord {
   stderr: string;
   durationMs: number;
   timedOut?: boolean;
+  /** Requirement ids this command proves (v0.5 covers declaration). */
+  covers?: string[];
 }
 
 export interface WorkflowAcceptanceFileRecord {
@@ -309,6 +364,10 @@ export interface WorkflowSnapshot {
   stages: WorkflowStageRecord[];
   evidence?: WorkflowEvidence;
   failure?: { stageName: string; reason: string; finalError?: string };
+  /** Absolute path of the terminal reconciliation ledger (v0.5, out/ directory). */
+  ledgerRef?: string;
+  /** Requirement ids still awaiting leader ruling when status is needs_ruling. */
+  needsRulingIds?: string[];
   startedAt: string;
   updatedAt: string;
 }
@@ -343,8 +402,41 @@ export interface WorkflowEngineOptions {
   homeDir?: string;
   /** M2 seam: returns the health-ordered candidate chain for an agent. */
   candidateResolver?: WorkflowCandidateResolver;
+  /**
+   * v0.5 requirement set (design §4.2) the terminal ledger reconciles against.
+   * Parsed + validated by the caller (MCP handler / CLI); the engine treats it
+   * as the row universe. Absent → no ledger is produced (legacy behavior).
+   */
+  requirements?: RequirementsFile;
+  /**
+   * v0.5 Tier 1 rule-based archive (design §6): invoked once at workflow
+   * terminal with every Bridge session the workflow produced. Best-effort —
+   * failures warn on stderr and never change the terminal state.
+   */
+  archiveSessions?: (params: {
+    workflowId: string;
+    ledgerRef: string;
+    archiveSessionIds: string[];
+    keepSessionIds: string[];
+  }) => Promise<{ archived: number }>;
+  /**
+   * P-079 checkpoint resume: a terminal snapshot of a previous run with the
+   * same spec name. Stages recorded as `passed` there are copied into this
+   * run (tasks, acceptance evidence, review rounds, Bridge sessions) and
+   * skipped instead of re-dispatched — the leader-ruling re-close path
+   * re-emits the ledger without burning tokens on already-passed stages.
+   * Stage names must match one-to-one; unmatched resume stages are ignored.
+   */
+  resumeSnapshot?: WorkflowSnapshot;
   /** Progress observer (CLI stage printing, tests). */
   onUpdate?: (snapshot: WorkflowSnapshot) => void;
+  /**
+   * Batch 3 #12 (P-080⑤): in-process event bus for the terminal push. When
+   * wired, the engine emits one `workflow.terminal` event (taskId=workflowId)
+   * when the run reaches a terminal status, so hosts receive the ending
+   * without polling. Best-effort — a missing bus just keeps polling-only.
+   */
+  eventBus?: AgentMeshEventBus;
 }
 
 /**
@@ -437,6 +529,15 @@ export function renderTaskTemplate(template: string, context: TaskTemplateContex
 /** Stall-classified failures the reRouteOnStall policy may re-dispatch (M2). */
 const STALL_CLASSIFIED_ERROR_CODES: readonly ErrorCode[] = ["TIMEOUT"];
 
+/** Normalizes the legacy string | v0.5 {cmd, covers} acceptance command form. */
+export function normalizeAcceptanceCommand(command: string | { cmd: string; covers?: string[] }): {
+  cmd: string;
+  covers?: string[];
+} {
+  if (typeof command === "string") return { cmd: command };
+  return command.covers ? { cmd: command.cmd, covers: [...command.covers] } : { cmd: command.cmd };
+}
+
 function isStallClassifiedFailure(result: AgentResult): boolean {
   return (
     result.status === "failed" &&
@@ -471,6 +572,7 @@ function appendWorkflowSnapshot(snapshot: WorkflowSnapshot, homeDir: string | un
 const WORKFLOW_STATUSES: readonly WorkflowOverallStatus[] = [
   "running",
   "done",
+  "needs_ruling",
   "escalated",
   "failed",
 ];
@@ -585,20 +687,56 @@ export class WorkflowEngine {
   private updatedAt = this.startedAt;
   private runPromise?: Promise<WorkflowSnapshot>;
   private currentStageIndex = 0;
+  private ledgerRef?: string;
+  private needsRulingIds?: string[];
+  private terminalPushed = false;
 
   constructor(spec: WorkflowSpec, options: WorkflowEngineOptions) {
     this.spec = spec;
     this.options = options;
     this.id = `wf_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
-    this.stageRecords = spec.stages.map((stage, index) => ({
-      name: stage.name,
-      index,
-      status: "pending",
-      transitions: [{ status: "pending", at: new Date().toISOString() }],
-      tasks: [],
-      sessionIds: [],
-      updatedAt: new Date().toISOString(),
-    }));
+    const resumeByName =
+      options.resumeSnapshot && options.resumeSnapshot.name === spec.name
+        ? new Map(options.resumeSnapshot.stages.map((stage) => [stage.name, stage]))
+        : undefined;
+    this.stageRecords = spec.stages.map((stage, index) => {
+      const record: WorkflowStageRecord = {
+        name: stage.name,
+        index,
+        status: "pending",
+        transitions: [{ status: "pending", at: new Date().toISOString() }],
+        tasks: [],
+        sessionIds: [],
+        updatedAt: new Date().toISOString(),
+      };
+      const resumed = resumeByName?.get(stage.name);
+      if (resumed && resumed.status === "passed") {
+        // P-079: inherit the completed stage wholesale — task records point at
+        // the previous run's task ids (kept as evidence pointers), and the
+        // Bridge sessions stay available for upstream context and rework.
+        record.status = "passed";
+        record.transitions.push({ status: "passed", at: resumed.updatedAt });
+        record.tasks = resumed.tasks.map((task) => ({ ...task }));
+        record.sessionIds = [...resumed.sessionIds];
+        record.acceptance = resumed.acceptance
+          ? {
+              commands: resumed.acceptance.commands.map((command) => ({ ...command })),
+              files: resumed.acceptance.files.map((file) => ({ ...file })),
+              ...(resumed.acceptance.ok !== undefined ? { ok: resumed.acceptance.ok } : {}),
+            }
+          : undefined;
+        record.review = resumed.review
+          ? {
+              ...resumed.review,
+              rounds: resumed.review.rounds.map((round) => ({ ...round })),
+            }
+          : undefined;
+        record.workerSessionId = resumed.workerSessionId;
+        record.startedAt = resumed.startedAt;
+        record.updatedAt = resumed.updatedAt;
+      }
+      return record;
+    });
     this.homeDir =
       options.homeDir ??
       // Derive the AgentMesh home from the background registry's tasks dir so
@@ -666,6 +804,8 @@ export class WorkflowEngine {
       })),
       ...(this.evidence ? { evidence: this.evidence } : {}),
       ...(this.failure ? { failure: this.failure } : {}),
+      ...(this.ledgerRef ? { ledgerRef: this.ledgerRef } : {}),
+      ...(this.needsRulingIds ? { needsRulingIds: [...this.needsRulingIds] } : {}),
       startedAt: this.startedAt,
       updatedAt: this.updatedAt,
     };
@@ -675,6 +815,9 @@ export class WorkflowEngine {
     try {
       for (const [index, stageSpec] of this.spec.stages.entries()) {
         const record = this.stageRecords[index]!;
+        // P-079 resume: stages inherited as `passed` from the resumed snapshot
+        // are skipped — no dispatch, no acceptance re-run, sessions preserved.
+        if (record.status === "passed") continue;
         const outcome = await this.runStage(stageSpec, record);
         if (outcome !== "passed") break;
       }
@@ -691,15 +834,91 @@ export class WorkflowEngine {
         finalError: message,
       };
     }
+    await this.finalizeTerminal();
     this.updatedAt = new Date().toISOString();
     this.persistAndNotify();
     return this.snapshot();
+  }
+
+  /**
+   * v0.5 terminal join (runs for every terminal status): builds the
+   * reconciliation ledger, persists it under <agentmeshHome>/out/, flips
+   * done → needs_ruling when unruled rows remain (fail-closed), and invokes
+   * the Tier 1 rule-based session archive. Best-effort by contract: ledger or
+   * archive I/O failures warn on stderr and never change the terminal status.
+   */
+  private async finalizeTerminal(): Promise<void> {
+    const requirements = this.options.requirements;
+    if (requirements) {
+      const ledger = buildLedger({
+        workflowId: this.id,
+        spec: this.spec,
+        snapshot: this.snapshot(),
+        requirements,
+        nowIso: new Date().toISOString(),
+      });
+      const filePath = ledgerFilePath(this.homeDir ?? resolveAgentMeshHome(), this.id);
+      try {
+        defaultStorage.writeJsonAtomic(filePath, ledger, { store: "workflows" });
+        this.ledgerRef = filePath;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `AgentMesh reconciliation ledger could not be written to '${filePath}': ${message}\n`,
+        );
+      }
+      if (this.overall === "done" && needsRuling(ledger)) {
+        this.overall = "needs_ruling";
+        this.needsRulingIds = pendingRulingIds(ledger);
+      }
+    }
+    await this.archiveWorkflowSessions();
+  }
+
+  /** Tier 1 rule-based archive across the workflow's produced sessions. */
+  private async archiveWorkflowSessions(): Promise<void> {
+    const archive = this.options.archiveSessions;
+    if (!archive) return;
+    const allSessionIds = [...new Set(this.stageRecords.flatMap((stage) => stage.sessionIds))];
+    if (allSessionIds.length === 0) return;
+    const lastStageWithSessions = [...this.stageRecords]
+      .reverse()
+      .find((stage) => stage.sessionIds.length > 0);
+    const keep = new Set(lastStageWithSessions?.sessionIds ?? []);
+    const archiveSessionIds = allSessionIds.filter((id) => !keep.has(id));
+    if (archiveSessionIds.length === 0) return;
+    try {
+      await archive({
+        workflowId: this.id,
+        // With a requirements set the placeholder points at the terminal
+        // ledger; without one it points at the persisted workflow state log.
+        ledgerRef: this.ledgerRef ?? `workflows.jsonl#${this.id}`,
+        archiveSessionIds,
+        keepSessionIds: [...keep],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `AgentMesh Tier 1 session archive failed for workflow '${this.id}': ${message}\n`,
+      );
+    }
   }
 
   private persistAndNotify(): void {
     this.updatedAt = new Date().toISOString();
     appendWorkflowSnapshot(this.snapshot(), this.homeDir);
     this.options.onUpdate?.(this.snapshot());
+    // Batch 3 #12 (P-080⑤): terminal push, emitted exactly once per run —
+    // finalizeTerminal flips overall before persisting, so the first
+    // persistAndNotify with a non-running overall is the terminal signal.
+    if (this.overall !== "running" && !this.terminalPushed) {
+      this.terminalPushed = true;
+      this.options.eventBus?.emit({
+        type: "workflow.terminal",
+        taskId: this.id,
+        status: this.overall,
+      });
+    }
     for (const waiter of this.updateWaiters) waiter();
     this.updateWaiters.clear();
   }
@@ -1102,7 +1321,8 @@ export class WorkflowEngine {
     const commands: WorkflowAcceptanceCommandRecord[] = [];
     let ok = true;
     for (const command of acceptance.commands) {
-      const result = await executeCommand(command, [], {
+      const normalized = normalizeAcceptanceCommand(command);
+      const result = await executeCommand(normalized.cmd, [], {
         cwd: this.options.cwd,
         shell: true,
         timeoutMs: acceptance.timeoutMs ?? DEFAULT_ACCEPTANCE_TIMEOUT_MS,
@@ -1110,13 +1330,14 @@ export class WorkflowEngine {
       const commandOk = result.exitCode === 0 && !result.timedOut;
       ok = ok && commandOk;
       commands.push({
-        command,
+        command: normalized.cmd,
         ok: commandOk,
         ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
         stdout: result.stdout,
         stderr: result.stderr,
         durationMs: result.durationMs,
         ...(result.timedOut ? { timedOut: true } : {}),
+        ...(normalized.covers ? { covers: normalized.covers } : {}),
       });
     }
     const files: WorkflowAcceptanceFileRecord[] = (acceptance.files ?? []).map((file) => ({

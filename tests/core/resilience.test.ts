@@ -4,6 +4,7 @@ import {
   CIRCUIT_OPEN_DURATION_MS,
   MAX_DISPATCH_ATTEMPTS,
   RETRY_BACKOFF_DELAYS_MS,
+  classifyErrorCode,
   evaluateCircuitBreaker,
   executeWithResilientRetries,
   initialCircuitBreakerState,
@@ -148,6 +149,22 @@ describe("core/resilience retry policy (P1 T1.3)", () => {
     expect(calls).toBe(1);
     expect(attempts).toBe(1);
     expect(result.status).toBe("failed");
+  });
+
+  // P-079①: an explicit HTTP status from the vendor payload (ISS-2
+  // extraction) must classify TRANSIENT even when the compressed vendor
+  // message carries no recognizable keyword (bare "APIError" 503s).
+  it("classifies retryable HTTP statuses as TRANSIENT_5XX regardless of message text", () => {
+    expect(classifyErrorCode({ message: "APIError", httpStatus: 503 })).toBe("TRANSIENT_5XX");
+    expect(classifyErrorCode({ httpStatus: 503 })).toBe("TRANSIENT_5XX");
+    expect(classifyErrorCode({ message: "APIError", httpStatus: 429 })).toBe("TRANSIENT_5XX");
+    expect(classifyErrorCode({ message: "APIError", httpStatus: 408 })).toBe("TRANSIENT_5XX");
+    expect(classifyErrorCode({ message: "APIError", httpStatus: 500 })).toBe("TRANSIENT_5XX");
+    // Non-retryable statuses must keep their message-driven classification.
+    expect(classifyErrorCode({ message: "APIError", httpStatus: 403 })).toBeUndefined();
+    expect(classifyErrorCode({ message: "Unknown model foo-bar", httpStatus: 404 })).toBe(
+      "MODEL_REJECTED",
+    );
   });
 });
 

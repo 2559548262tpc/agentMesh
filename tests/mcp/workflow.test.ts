@@ -85,13 +85,34 @@ interface WorkflowPayload {
     acceptance?: { ok?: boolean };
   }>;
   stages_listed?: string[];
+  ledgerRef?: string;
   error?: string;
   issues?: string[];
 }
 
+/** v0.5 compact envelope (P-080①): bounded stage list + flag bits, no payloads. */
+interface CompactWorkflowPayload {
+  workflowId?: string;
+  status?: string;
+  stageCount?: number;
+  stages?: Array<{ name: string; status: string }>;
+  flags?: { unresolvedP0P1?: number; coverage?: string; anomalies?: string[] };
+  ledgerRef?: string;
+  needsRulingIds?: string[];
+}
+
 function parsePayload(res: unknown): WorkflowPayload {
   const content = (res as { content?: Array<{ type: string; text: string }> }).content ?? [];
-  return JSON.parse(content[0]?.text ?? "{}") as WorkflowPayload;
+  const text = content[0]?.text ?? "{}";
+  // Tier 0 (P-080②): an oversized full snapshot is persisted and replaced by
+  // its tail + path — the honest way to read it back is from the artifact.
+  const tier0 = text.match(
+    /^\[tier0: return body \d+ chars exceeded \d+; full output persisted to (.+?); showing/,
+  );
+  if (tier0) {
+    return JSON.parse(fs.readFileSync(tier0[1]!, "utf-8")) as WorkflowPayload;
+  }
+  return JSON.parse(text) as WorkflowPayload;
 }
 
 describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () => {
@@ -185,12 +206,14 @@ describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () =
     expect(launched.workflowId).toMatch(/^wf_/);
     expect(launched.stages).toEqual(["implement"]);
 
-    // Event-driven long-poll until the terminal snapshot arrives.
+    // Event-driven long-poll until the terminal snapshot arrives. v0.5: the
+    // full snapshot requires an explicit detail:"full" request — the compact
+    // envelope is the default (asserted separately below).
     let payload: WorkflowPayload = {};
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const res = await client.callTool({
         name: "get_workflow",
-        arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000 },
+        arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000, detail: "full" },
       });
       payload = parsePayload(res);
       if (
@@ -209,6 +232,19 @@ describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () =
     expect(stage.tasks![0]!.taskId).toBe(`${launched.workflowId}_s0_1`);
     expect(stage.acceptance).toMatchObject({ ok: true });
     expect(resIsErrorFor(payload.status)).toBe(false);
+
+    // Compact default (P-080①): bounded envelope with flag bits, no task
+    // payloads, and the Tier 0 rule keeps it far below the spill threshold.
+    const compactRes = await client.callTool({
+      name: "get_workflow",
+      arguments: { workflowId: launched.workflowId! },
+    });
+    const compactPayload = JSON.parse(
+      (compactRes.content as Array<{ type: string; text: string }>)[0]!.text,
+    ) as CompactWorkflowPayload;
+    expect(compactPayload.status).toBe("done");
+    expect(compactPayload.stages).toEqual([{ name: "implement", status: "passed" }]);
+    expect(compactPayload.flags?.unresolvedP0P1).toBe(0);
   });
 
   it("runs the reviewer-stage rework loop to a PASS verdict through MCP", async () => {
@@ -241,7 +277,7 @@ describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () =
     for (let attempt = 0; attempt < 20; attempt += 1) {
       const res = await client.callTool({
         name: "get_workflow",
-        arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000 },
+        arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000, detail: "full" },
       });
       payload = parsePayload(res);
       if (payload.status !== "running") break;
@@ -261,6 +297,118 @@ describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () =
     });
     expect(res.isError).toBe(true);
     expect(parsePayload(res).error).toBe("NOT_FOUND");
+  });
+
+  describe("v0.5 requirements reconciliation over MCP", () => {
+    const writeRequirements = (options: { quote?: string } = {}) => {
+      const sourceDoc = "# Spec\n\n- build the widget\n- 要好看\n";
+      fs.writeFileSync(path.join(workDir, "spec-doc.md"), sourceDoc, "utf-8");
+      fs.writeFileSync(
+        path.join(workDir, "requirements.json"),
+        JSON.stringify({
+          source: "spec-doc.md",
+          items: [
+            {
+              id: "R1",
+              ears: "The system SHALL build the widget",
+              kind: "unconditional",
+              quote: options.quote ?? "build the widget",
+              decidable: true,
+            },
+            { id: "R2", ears: null, kind: null, quote: "要好看", decidable: false },
+          ],
+        }),
+        "utf-8",
+      );
+    };
+
+    const stageWithRequirements = {
+      name: "implement",
+      roles: ["worker"],
+      requirements: ["R1", "R2"],
+      dispatch: { agent: "codex", taskTemplate: "Build it" },
+      acceptance: {
+        commands: [{ cmd: `node -e "process.exit(0)"`, covers: ["R1"] }],
+      },
+    };
+
+    it("fails closed on a quote that is not a verbatim source substring", async () => {
+      writeRequirements({ quote: "fabricated sentence" });
+      const res = await client.callTool({
+        name: "run_workflow",
+        arguments: {
+          cwd: workDir,
+          requirementsPath: "requirements.json",
+          spec: { name: "wf", stages: [stageWithRequirements] },
+        },
+      });
+      expect(res.isError).toBe(true);
+      const payload = parsePayload(res) as unknown as { error?: string; source?: string };
+      expect(payload.error).toBe("QUOTE_VERIFICATION_FAILED");
+      expect(payload.source).toBe("spec-doc.md");
+    });
+
+    it("rejects spec-declared requirement ids missing from the requirements set", async () => {
+      writeRequirements();
+      const res = await client.callTool({
+        name: "run_workflow",
+        arguments: {
+          cwd: workDir,
+          requirementsPath: "requirements.json",
+          spec: {
+            name: "wf",
+            stages: [
+              {
+                ...stageWithRequirements,
+                requirements: ["R1", "R9"],
+              },
+            ],
+          },
+        },
+      });
+      expect(res.isError).toBe(true);
+      const payload = parsePayload(res) as unknown as { error?: string; issues?: string[] };
+      expect(payload.error).toBe("INVALID_REQUIREMENTS");
+      expect(payload.issues?.[0]).toContain("R9");
+    });
+
+    it("runs to needs_ruling with the compact envelope carrying coverage and the ledger pointer", async () => {
+      writeRequirements();
+      const launch = await client.callTool({
+        name: "run_workflow",
+        arguments: {
+          cwd: workDir,
+          requirementsPath: "requirements.json",
+          spec: { name: "reconciled", stages: [stageWithRequirements] },
+        },
+      });
+      expect(launch.isError).toBeFalsy();
+      const launched = parsePayload(launch);
+
+      let payload: WorkflowPayload & CompactWorkflowPayload = {};
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const res = await client.callTool({
+          name: "get_workflow",
+          arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000 },
+        });
+        payload = parsePayload(res);
+        if (payload.status !== "running") break;
+      }
+      expect(payload.status).toBe("needs_ruling");
+      expect(payload.flags?.coverage).toBe("1/2（1 PENDING_RULING）");
+      expect((payload.flags?.anomalies ?? []).join("\n")).toContain("needs_ruling:1");
+      expect(payload.ledgerRef).toContain(path.join("out", `ledger_${launched.workflowId}.json`));
+      const ledger = JSON.parse(fs.readFileSync(payload.ledgerRef!, "utf-8")) as {
+        rows: Array<{ id: string; status: string }>;
+        invariant: { ok: boolean };
+      };
+      expect(ledger.rows.find((row) => row.id === "R1")).toMatchObject({ status: "PASS" });
+      expect(ledger.rows.find((row) => row.id === "R2")).toMatchObject({
+        status: "PENDING_RULING",
+      });
+      expect(ledger.invariant.ok).toBe(true);
+      expect(resIsErrorFor(payload.status)).toBe(false);
+    });
   });
 });
 

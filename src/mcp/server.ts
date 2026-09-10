@@ -45,11 +45,21 @@ function attachBackgroundTaskNotifier(
   const bus = background.registry.eventBus;
   if (!bus) return;
   bus.subscribe((event) => {
-    if (event.type !== "task.completed" && event.type !== "task.stalled") return;
+    if (
+      event.type !== "task.completed" &&
+      event.type !== "task.stalled" &&
+      event.type !== "workflow.terminal"
+    ) {
+      return;
+    }
     const data =
       event.type === "task.completed"
         ? `Background task ${event.taskId} ${event.status}. Call poll_task with taskId="${event.taskId}" to fetch the terminal result.`
-        : `Background task ${event.taskId} appears stalled (no output for a while). Inspect it with poll_task.`;
+        : event.type === "task.stalled"
+          ? `Background task ${event.taskId} appears stalled (no output for a while). Inspect it with poll_task.`
+          : // Batch 3 #12 (P-080⑤): workflow terminal push — the host learns
+            // the ending without long-polling get_workflow to exhaustion.
+            `Workflow ${event.taskId} reached terminal status '${event.status}'. Call get_workflow with workflowId="${event.taskId}" to read the terminal snapshot (and the ledger pointer when requirements were reconciled).`;
     try {
       void server.sendLoggingMessage({ level: "info", logger: "agentmesh", data }).catch(() => {
         // Hosts may reject unsupported notifications; never crash the task.

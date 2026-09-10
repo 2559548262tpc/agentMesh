@@ -425,19 +425,25 @@ export function foldModelHealth(
 /**
  * Aggregates one agent's per-model entries into a single ordering signal for
  * candidate resolution. Conservative on purpose: the score is the agent's
- * worst recorded model, and the agent only counts as quarantined when every
+ * worst recorded model, the agent only counts as quarantined when every
  * model observed for it is quarantined (a healthy sibling model is still
- * dispatchable).
+ * dispatchable), and the latency signal is the median of the models' p50
+ * durations (#9.5 latency-aware routing). Undefined p50 = no samples yet.
  */
 export function resolveAgentHealthCandidate(
   entries: ModelHealthEntry[],
   agent: string,
-): { score: number; quarantined: boolean } | undefined {
+): { score: number; quarantined: boolean; p50DurationMs?: number } | undefined {
   const owned = entries.filter((entry) => entry.agent === agent);
   if (owned.length === 0) return undefined;
+  const p50s = owned
+    .map((entry) => entry.p50DurationMs)
+    .filter((value): value is number => value > 0)
+    .sort((a, b) => a - b);
   return {
     score: Math.min(...owned.map((entry) => entry.score)),
     quarantined: owned.every((entry) => entry.quarantined),
+    ...(p50s.length > 0 ? { p50DurationMs: percentile(p50s, 0.5) } : {}),
   };
 }
 
@@ -458,16 +464,20 @@ export interface HealthOrderedCandidates {
 export interface HealthCandidateSignal {
   score: number;
   quarantined: boolean;
+  /** Median of the agent's models' p50 dispatch durations; undefined without samples. */
+  p50DurationMs?: number;
 }
 
 /**
  * Pure, deterministic candidate ordering: tier match first (candidates whose
  * declared tier equals the reference tier), then health score (healthy
- * candidates first, higher score first), then declared costLevel ascending
- * (unmetered entries last, declaration order kept for ties — the sort is
- * stable). Quarantined candidates are excluded entirely; only when nothing
- * else remains are they reinstated (original order, tier/costLevel sorted)
- * and flagged through the returned warning.
+ * candidates first, higher score first), then observed p50 latency ascending
+ * (#9.5 latency-aware routing — speed-critical fast-lane ordering; candidates
+ * without latency samples rank behind measured ones), then declared
+ * costLevel ascending (unmetered entries last, declaration order kept for
+ * ties — the sort is stable). Quarantined candidates are excluded entirely;
+ * only when nothing else remains are they reinstated (original order,
+ * tier/costLevel sorted) and flagged through the returned warning.
  */
 export function orderCandidatesByHealth(params: {
   candidates: HealthWeightedCandidate[];
@@ -479,6 +489,8 @@ export function orderCandidatesByHealth(params: {
     candidate.tier !== undefined && candidate.tier === referenceTier ? 0 : 1;
   const costRank = (candidate: HealthWeightedCandidate): number =>
     candidate.costLevel ?? Number.POSITIVE_INFINITY;
+  const latencyRank = (candidate: HealthWeightedCandidate): number =>
+    healthOf?.(candidate.key)?.p50DurationMs ?? Number.POSITIVE_INFINITY;
 
   const partitioned = {
     healthy: [] as HealthWeightedCandidate[],
@@ -494,6 +506,7 @@ export function orderCandidatesByHealth(params: {
     (a, b) =>
       tierRank(a) - tierRank(b) ||
       (healthOf?.(b.key)?.score ?? 1) - (healthOf?.(a.key)?.score ?? 1) ||
+      latencyRank(a) - latencyRank(b) ||
       costRank(a) - costRank(b),
   );
   if (healthySorted.length > 0) return { candidates: healthySorted };

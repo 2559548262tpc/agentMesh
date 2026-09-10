@@ -31,6 +31,20 @@ import {
 import type { FindingRecord } from "../core/findings.js";
 import { verifyContractMap } from "../core/contractMap.js";
 import {
+  applyTier0ReturnTruncation,
+  buildCompactWorkflowView,
+  readLedgerCoverage,
+} from "../core/compact.js";
+import {
+  crossCheckRequirementCount,
+  parseRequirementsFile,
+  verifyRequirementQuotes,
+} from "../core/requirements.js";
+import type { RequirementsFile } from "../core/requirements.js";
+import { findUnknownRequirementIds } from "../core/ledger.js";
+import type { PollTaskOutcome } from "../core/background.js";
+import type { WorkflowSnapshot } from "../core/workflow.js";
+import {
   WorkflowEngineRegistry,
   WorkflowSpecSchema,
   createDefaultCandidateResolver,
@@ -184,6 +198,84 @@ async function sendProgress(
   } catch {
     // Progress is advisory and must not change the task outcome.
   }
+}
+
+/** Detail level of a v0.5 leader-facing return (P-080①). */
+type WorkflowDetail = "compact" | "full";
+
+/** Compact poll output tail budget (design §6 Tier 0: 1.5KB). */
+const COMPACT_TAIL_LIMIT_CHARS = 1_500;
+
+/**
+ * v0.5 get_workflow renderer: compact (default) emits the bounded envelope
+ * with flag bits + ledger pointer; full emits the complete snapshot. Both go
+ * through the Tier 0 rule — a return body over 2KB is persisted under
+ * <agentmeshHome>/out/ and replaced by its tail + path (P-080②), so the
+ * leader's context never ingests the bulk.
+ */
+function renderWorkflowResponse(
+  snapshot: WorkflowSnapshot,
+  detail: WorkflowDetail,
+  homeDir: string,
+  note?: string,
+) {
+  let text: string;
+  if (detail === "compact") {
+    const coverage = readLedgerCoverage(snapshot.ledgerRef);
+    const view = buildCompactWorkflowView(snapshot, {
+      ...(coverage.coverage ? { coverage: coverage.coverage } : {}),
+      note:
+        [note, coverage.error].filter((part): part is string => Boolean(part)).join(" ") ||
+        undefined,
+    });
+    text = JSON.stringify(view, null, 2);
+  } else {
+    text = JSON.stringify(note ? { ...snapshot, note } : snapshot, null, 2);
+  }
+  const tier0 = applyTier0ReturnTruncation(text, `workflow_${snapshot.workflowId}_${detail}`, {
+    homeDir,
+  });
+  return {
+    content: [{ type: "text" as const, text: tier0.text }],
+    isError: snapshot.status === "failed" || snapshot.status === "escalated",
+  };
+}
+
+/**
+ * v0.5 poll_task compact view (P-080①): status bookkeeping plus at most the
+ * last 1.5KB of new output; the on-disk task output file remains the full
+ * transcript, so no information is lost — only kept out of the leader's
+ * context until actually needed.
+ */
+function buildCompactPollView(outcome: PollTaskOutcome, outputFile: string) {
+  const tail = outcome.outputSinceOffset;
+  const truncated = tail.length > COMPACT_TAIL_LIMIT_CHARS;
+  const { result } = outcome;
+  return {
+    taskId: outcome.taskId,
+    status: outcome.status,
+    nextOffset: outcome.nextOffset,
+    hasMore: outcome.hasMore,
+    outputFile,
+    outputTail: truncated ? tail.slice(-COMPACT_TAIL_LIMIT_CHARS) : tail,
+    ...(truncated ? { outputTailOmittedChars: tail.length - COMPACT_TAIL_LIMIT_CHARS } : {}),
+    ...(result
+      ? {
+          result: {
+            status: result.status,
+            summary: result.summary !== undefined ? truncateText(result.summary, 300) : undefined,
+            ...(result.error ? { error: truncateText(result.error, 300) } : {}),
+            ...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
+            ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+            completedAtMs: result.completedAtMs,
+          },
+        }
+      : {}),
+    ...(outcome.queuePosition !== undefined ? { queuePosition: outcome.queuePosition } : {}),
+    ...(outcome.blockedBy ? { blockedBy: outcome.blockedBy } : {}),
+    ...(outcome.interruptedAtMs !== undefined ? { interruptedAtMs: outcome.interruptedAtMs } : {}),
+    ...(outcome.guidance ? { guidance: outcome.guidance } : {}),
+  };
 }
 
 /** Combines the MCP request signal with a background dispatch controller. */
@@ -910,6 +1002,15 @@ export const PollTaskInputSchema = z.object({
         "state arrives (event-driven), up to this ceiling. Recommended 30000; omit for a " +
         "quick non-blocking status check",
     ),
+  detail: z
+    .enum(["compact", "full"])
+    .optional()
+    .describe(
+      "v0.5 return shape. 'compact' (default, P-080①) returns status, nextOffset and at most the " +
+        "last 1.5KB of new output plus the output-file pointer — the task output file on disk stays " +
+        "the full transcript. 'full' returns the complete incremental output since sinceOffset " +
+        "(legacy behavior; can be very large)",
+    ),
 });
 
 export const ReviewChangesInputSchema = z.object({
@@ -1025,12 +1126,31 @@ export const RunWorkflowInputSchema = z.object({
   spec: WorkflowSpecSchema.describe(
     "Workflow specification: named stages with dispatch (agent, taskTemplate with " +
       "{{workflowName}}/{{stageName}}/{{group}}/{{upstreamSummaries}} substitution, contextPolicy), " +
-      "acceptance (commands + required files), and policy (maxReworkRounds, escalateOn, reRouteOnStall). " +
+      "acceptance (commands, each optionally declaring covers:[R...] requirement ids + required files), " +
+      "and policy (maxReworkRounds, escalateOn, reRouteOnStall). " +
       "Each stage declares exactly one of roles or parallelGroups",
   ),
   cwd: NonBlankString.optional().describe(
     "Working directory for stage dispatches and acceptance commands (defaults to current directory)",
   ),
+  requirementsPath: NonBlankString.optional().describe(
+    "v0.5 path to a requirements.json (EARS items with verbatim source quotes). The engine validates " +
+      "the schema, verifies every quote is a verbatim substring of the source document, and reconciles " +
+      "the terminal ledger against it (out/ledger_<workflowId>.json). While PENDING_RULING rows remain " +
+      "the workflow terminates as needs_ruling instead of done — rule the rows and re-run the ledger close-out",
+  ),
+  resumeFromWorkflowId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(80)
+    .optional()
+    .describe(
+      "P-079 checkpoint resume: a workflow ID from a previous terminal run with the SAME spec name. " +
+        "Stages recorded as passed in that run are inherited (tasks, acceptance evidence, review " +
+        "rounds, Bridge sessions) and skipped — after a needs_ruling ruling, re-run with the same " +
+        "spec to re-close the ledger without re-dispatching already-passed stages",
+    ),
 });
 
 export const GetWorkflowInputSchema = z.object({
@@ -1046,6 +1166,16 @@ export const GetWorkflowInputSchema = z.object({
         "until the state changes or the workflow reaches a terminal status (event-driven), up to this " +
         "ceiling. Recommended 30000; omit for a quick non-blocking status check. Persisted snapshots " +
         "(workflow not owned by this process) are returned immediately",
+    ),
+  detail: z
+    .enum(["compact", "full"])
+    .optional()
+    .describe(
+      "v0.5 return shape. 'compact' (default, P-080①) returns a bounded envelope: status, per-stage " +
+        "statuses, flag bits (unresolvedP0P1/coverage/anomalies) and the ledger pointer. 'full' returns " +
+        "the complete snapshot. Either way the Tier 0 rule applies: return bodies over 2KB are persisted " +
+        "under <agentmeshHome>/out/ and replaced by the tail + path (P-080②) — read the file when you " +
+        "actually need the full payload",
     ),
 });
 
@@ -1225,6 +1355,22 @@ export const VerifyContractMapInputSchema = z.object({
     )
     .min(1)
     .describe("Contract checklist items the worker had to satisfy"),
+  requirementIds: z
+    .array(
+      z
+        .string()
+        .trim()
+        .regex(/^R\d+$/, "requirement id must match R<number>")
+        .min(1)
+        .max(64),
+    )
+    .max(64)
+    .optional()
+    .describe(
+      "v0.5: requirement ids (R1..Rn) the task had to implement. Each becomes a required map entry " +
+        "id — a worker map missing an R id fails with 'missing', an entry for an undeclared id is " +
+        "'unknown-item'. Duplicates of ids already present in contractItems are ignored",
+    ),
   map: z
     .array(
       z.object({
@@ -1464,7 +1610,7 @@ export function registerMcpTools(
   // poll_task
   server.tool(
     "poll_task",
-    "Observes a background delegate_task: reports status (running/queued/blocked/completed/failed/stalled — queued/blocked are M7b queue states carrying queuePosition and blockedBy), the incremental output since a byte offset, and the terminal result once available",
+    "Observes a background delegate_task: reports status (running/queued/blocked/completed/failed/stalled — queued/blocked are M7b queue states carrying queuePosition and blockedBy), the incremental output since a byte offset, and the terminal result once available. v0.5: compact envelope by default (P-080① — at most the last 1.5KB of new output plus the output-file pointer); detail:'full' returns the complete incremental output (legacy behavior).",
     PollTaskInputSchema.shape,
     async (args: z.infer<typeof PollTaskInputSchema>) => {
       try {
@@ -1476,11 +1622,22 @@ export function registerMcpTools(
           // blocks until activity instead of sleep-polling every 100ms.
           waitForActivity: (id) => background.registry.waitForActivity(id),
         });
+        const text =
+          (args.detail ?? "compact") === "compact"
+            ? JSON.stringify(
+                buildCompactPollView(outcome, background.registry.outputFilePath(args.taskId)),
+                null,
+                2,
+              )
+            : JSON.stringify(outcome, null, 2);
+        const tier0 = applyTier0ReturnTruncation(text, `task_${args.taskId}_poll`, {
+          homeDir: path.dirname(path.resolve(background.registry.tasksDirectory)),
+        });
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(outcome, null, 2),
+              text: tier0.text,
             },
           ],
         };
@@ -1675,8 +1832,9 @@ export function registerMcpTools(
     [
       "Runs a declarative workflow spec through the in-process deterministic state machine (no LLM orchestrator in the loop): each stage dispatches agents (worker/reviewer/tester roles or parallelGroups packages), runs its acceptance commands + file checks, and for reviewer stages loops bounded rework (findings re-injected into the worker session via continue_task) until PASS or rounds are exhausted.",
       "Stage dispatches run as background tasks through the same registry/watchdog/cancel_task path as delegate_task(background:true); waiting is event-driven. Dispatch failures re-route along the health-ordered candidate chain when the stage policy declares reRouteOnStall.",
-      "Terminal statuses: done (every stage passed), escalated (the configured escalateOn failure class hit — the snapshot carries the full evidence chain: per-round findings, acceptance command outputs, repository diff summary), failed (any other stage failure). ESCALATED is the only point where the LLM orchestrator or the human takes over.",
-      "Always asynchronous: returns immediately with workflowId; observe with get_workflow (maxWaitMs=30000 for event-driven long-polling).",
+      "Terminal statuses: done (every stage passed), needs_ruling (v0.5: stages passed but the reconciliation ledger carries PENDING_RULING rows — rule them, then re-close the ledger), escalated (the configured escalateOn failure class hit — the snapshot carries the full evidence chain: per-round findings, acceptance command outputs, repository diff summary), failed (any other stage failure). ESCALATED is the only point where the LLM orchestrator or the human takes over.",
+      "v0.5 requirements: pass requirementsPath to reconcile the run against a requirements.json (EARS + verbatim quotes + decidable flags). The engine verifies quotes mechanically (substring of the source document), validates spec-declared requirement ids against it, and writes the terminal reconciliation ledger to <agentmeshHome>/out/ledger_<workflowId>.json. At terminal the workflow's Bridge sessions are rule-archived to pointer placeholders (Tier 1).",
+      "Always asynchronous: returns immediately with workflowId; observe with get_workflow (maxWaitMs=30000 for event-driven long-polling, compact envelope by default) until the status is terminal.",
     ].join("\n"),
     RunWorkflowInputSchema.shape,
     async (args: z.infer<typeof RunWorkflowInputSchema>) => {
@@ -1694,11 +1852,167 @@ export function registerMcpTools(
           };
         }
         const cwd = args.cwd ?? process.cwd();
+        let requirements: RequirementsFile | undefined;
+        if (args.requirementsPath) {
+          try {
+            const reqPath = path.isAbsolute(args.requirementsPath)
+              ? args.requirementsPath
+              : path.resolve(cwd, args.requirementsPath);
+            const raw = readFileSync(reqPath, "utf-8");
+            const parsedRequirements = parseRequirementsFile(JSON.parse(raw));
+            if (!parsedRequirements.success || !parsedRequirements.requirements) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      {
+                        error: "INVALID_REQUIREMENTS",
+                        issues: parsedRequirements.issues,
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+            requirements = parsedRequirements.requirements;
+            // Mechanical provenance gate (v0.5 §4.2): every quote must be a
+            // verbatim substring of the source document when that document is
+            // resolvable. Leader-handwritten files may reference a title, so
+            // an unreadable source warns instead of failing the run.
+            const sourcePath = path.isAbsolute(requirements.source)
+              ? requirements.source
+              : path.resolve(path.dirname(reqPath), requirements.source);
+            if (existsSync(sourcePath)) {
+              const sourceDocument = readFileSync(sourcePath, "utf-8");
+              const quoteReport = verifyRequirementQuotes(sourceDocument, requirements.items);
+              const failedQuotes = quoteReport.items.filter((item) => !item.ok);
+              if (!quoteReport.pass) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(
+                        {
+                          error: "QUOTE_VERIFICATION_FAILED",
+                          source: requirements.source,
+                          failedQuotes,
+                        },
+                        null,
+                        2,
+                      ),
+                    },
+                  ],
+                  isError: true,
+                };
+              }
+              const countCheck = crossCheckRequirementCount(sourceDocument, requirements.items);
+              if (!countCheck.plausible) {
+                process.stderr.write(
+                  `AgentMesh requirements check: ${countCheck.itemCount} items exceed the source ` +
+                    `document's structural units (${countCheck.sectionCount} sections + ` +
+                    `${countCheck.listItemCount} list entries) — possible merged or invented items.\n`,
+                );
+              }
+            } else {
+              process.stderr.write(
+                `AgentMesh requirements check: source document '${requirements.source}' is not ` +
+                  `readable from '${sourcePath}'; quote provenance was NOT verified.\n`,
+              );
+            }
+            const unknownIds = findUnknownRequirementIds(parsed.spec, requirements);
+            if (unknownIds.length > 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      {
+                        error: "INVALID_REQUIREMENTS",
+                        issues: unknownIds.map(
+                          (id) =>
+                            `spec declares '${id}' which is absent from the requirements set.`,
+                        ),
+                      },
+                      null,
+                      2,
+                    ),
+                  },
+                ],
+                isError: true,
+              };
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      error: "INVALID_REQUIREMENTS",
+                      issues: [`requirements file could not be loaded: ${message}`],
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
         const engine = workflowEngines.create(parsed.spec, {
           dispatch: runner,
           background,
           cwd,
           candidateResolver: createDefaultCandidateResolver(runner, cwd),
+          ...(requirements ? { requirements } : {}),
+          // Batch 3 #12 (P-080⑤): push the terminal status to the host via
+          // the logging-notification channel instead of polling only.
+          eventBus: background.registry.eventBus,
+          ...(args.resumeFromWorkflowId
+            ? (() => {
+                // P-079: load the persisted terminal snapshot and inherit its
+                // passed stages. A missing/mismatched id is advisory — the run
+                // proceeds from scratch instead of failing (resume is an
+                // optimization, never a correctness requirement).
+                const homeDir = path.dirname(path.resolve(background.registry.tasksDirectory));
+                const resumed = readPersistedWorkflowSnapshot(args.resumeFromWorkflowId, {
+                  homeDir,
+                });
+                if (!resumed) {
+                  process.stderr.write(
+                    `AgentMesh run_workflow: resume source '${args.resumeFromWorkflowId}' has no persisted snapshot; starting from scratch.\n`,
+                  );
+                  return {};
+                }
+                if (resumed.name !== parsed.spec.name) {
+                  process.stderr.write(
+                    `AgentMesh run_workflow: resume source '${args.resumeFromWorkflowId}' is for spec '${resumed.name}', not '${parsed.spec.name}'; starting from scratch.\n`,
+                  );
+                  return {};
+                }
+                const inherited = resumed.stages.filter(
+                  (stage) => stage.status === "passed",
+                ).length;
+                process.stderr.write(
+                  `AgentMesh run_workflow: resuming from '${args.resumeFromWorkflowId}' — ${inherited}/${parsed.spec.stages.length} stage(s) inherited as passed.\n`,
+                );
+                return { resumeSnapshot: resumed };
+              })()
+            : {}),
+          archiveSessions: (params) => {
+            const outcome = runner.archiveWorkflowSessions({
+              archiveSessionIds: params.archiveSessionIds,
+              keepSessionIds: params.keepSessionIds,
+              ledgerRef: params.ledgerRef,
+            });
+            return Promise.resolve({ archived: outcome.reports.length });
+          },
         });
         void engine.run();
         return {
@@ -1711,8 +2025,19 @@ export function registerMcpTools(
                   name: parsed.spec.name,
                   status: "running",
                   stages: parsed.spec.stages.map((stage) => stage.name),
+                  ...(requirements
+                    ? {
+                        requirements: {
+                          source: requirements.source,
+                          items: requirements.items.length,
+                        },
+                      }
+                    : {}),
                   guidance:
-                    "The workflow executes asynchronously; call get_workflow with maxWaitMs=30000 (event-driven long-poll) until the status is terminal. Each stage dispatch is visible to poll_task/cancel_task under the task IDs <workflowId>_s<stage>_<seq>.",
+                    "The workflow executes asynchronously; call get_workflow with maxWaitMs=30000 (event-driven long-poll) until the status is terminal. Each stage dispatch is visible to poll_task/cancel_task under the task IDs <workflowId>_s<stage>_<seq>." +
+                    (requirements
+                      ? " At terminal, get_workflow returns the compact envelope with the ledger pointer; while PENDING_RULING rows remain the status is needs_ruling."
+                      : ""),
                 },
                 null,
                 2,
@@ -1738,38 +2063,24 @@ export function registerMcpTools(
   // get_workflow — observe a workflow run (live engine or persisted snapshot)
   server.tool(
     "get_workflow",
-    "Returns the current workflow snapshot: overall status (running/done/escalated/failed), per-stage status transitions, dispatched task records, acceptance command results, review verdicts with per-round findings, and the full evidence chain for terminal failures. Live workflows owned by this bridge process support event-driven long-polling via maxWaitMs; workflows from earlier bridge processes are served from the persisted workflow log.",
+    "Returns the workflow state: compact envelope by default (v0.5, P-080① — status, per-stage statuses, flag bits unresolvedP0P1/coverage/anomalies, ledger pointer); detail:'full' returns the complete snapshot. Terminal statuses: running/done/needs_ruling/escalated/failed. Either mode obeys the Tier 0 rule (P-080②): return bodies over 2KB are persisted under <agentmeshHome>/out/ and replaced by the tail + path. Live workflows owned by this bridge process support event-driven long-polling via maxWaitMs; workflows from earlier bridge processes are served from the persisted workflow log.",
     GetWorkflowInputSchema.shape,
     async (args: z.infer<typeof GetWorkflowInputSchema>) => {
       try {
+        const detail: WorkflowDetail = args.detail ?? "compact";
+        const homeDir = path.dirname(path.resolve(background.registry.tasksDirectory));
         const engine = workflowEngines.get(args.workflowId);
         if (engine) {
           const snapshot = await engine.waitForUpdate(args.maxWaitMs ?? 0);
-          return {
-            content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-            isError: snapshot.status === "failed" || snapshot.status === "escalated",
-          };
+          return renderWorkflowResponse(snapshot, detail, homeDir);
         }
         const persisted = readPersistedWorkflowSnapshot(args.workflowId);
         if (persisted) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  persisted.status === "running"
-                    ? {
-                        ...persisted,
-                        note: "Persisted snapshot: this workflow was started by another bridge process, so no live long-polling is available. If that process died, its stage tasks are dead-lettered and the workflow will never advance.",
-                      }
-                    : persisted,
-                  null,
-                  2,
-                ),
-              },
-            ],
-            isError: persisted.status === "failed" || persisted.status === "escalated",
-          };
+          const note =
+            persisted.status === "running"
+              ? "Persisted snapshot: this workflow was started by another bridge process, so no live long-polling is available. If that process died, its stage tasks are dead-lettered and the workflow will never advance."
+              : undefined;
+          return renderWorkflowResponse(persisted, detail, homeDir, note);
         }
         return {
           content: [
@@ -2149,14 +2460,25 @@ export function registerMcpTools(
     "verify_contract_map",
     [
       "Machine-verifies a worker-delivered contract map (contract item id -> file:line) without spending LLM tokens: every mapped file must exist and be readable, the referenced line must be within bounds, and the line must be non-empty.",
+      "v0.5: contract items may be requirement ids (R1..Rn). Pass requirementIds to enforce that the worker mapped every declared requirement — an R id without a map entry fails as 'missing', a map entry for an undeclared id fails as 'unknown-item'.",
       "Use it as the quick-review gate over a task's contract checklist before any deep LLM review; a pass:false report lists each item's failure status (missing | out-of-bounds | empty | unknown-item) so the worker can repair the mapping without a reviewer round.",
     ].join("\n"),
     VerifyContractMapInputSchema.shape,
     async (args: z.infer<typeof VerifyContractMapInputSchema>) => {
       try {
         const cwd = args.cwd ?? process.cwd();
-        const report = verifyContractMap(args.contractItems, args.map, (filePath) =>
-          readFileSync(path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath), "utf-8"),
+        const declaredIds = new Set(args.contractItems.map((item) => item.id));
+        const requirementItems = (args.requirementIds ?? [])
+          .filter((id) => !declaredIds.has(id))
+          .map((id) => ({
+            id,
+            text: `Requirement ${id}: map the file:line that implements this requirement`,
+          }));
+        const report = verifyContractMap(
+          [...args.contractItems, ...requirementItems],
+          args.map,
+          (filePath) =>
+            readFileSync(path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath), "utf-8"),
         );
         return {
           content: [{ type: "text", text: JSON.stringify(report, null, 2) }],

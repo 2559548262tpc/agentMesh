@@ -1700,3 +1700,85 @@ stdio 驱动独立桥接 serve 进程 → MCP `delegate_task(background:true, mo
 3. **P1 — cancel_task（P-R21-2）**：stalled 检测已存在但缺"止损动作"，补取消工具即闭环。
 4. **P2 — 树守卫默认排除 `.agentmesh/**`（P-R21-4）\*\*：一行默认值，消除整轮浪费。
 5. **编排纪律沉淀**：派发前必查 cwd 下 `.agentmesh/config.json` 实存（r21-3 的教训）；免费评审模型 0 字节 2 分钟即弃（本轮后期已按此执行）。
+
+# 第二十二轮真实测试（2026-09-08）：v0.5 需求对账单架构真实链路验证（opencode 免费档全链路）
+
+## 0. 测试设计
+
+- **目标**：检验 v0.5 Batch 1（#0-#6）在真实 vendor 通道上的行为——requirements 贯穿、终态对账单 ledger、`needs_ruling` 终态、compact/Tier 0/Tier 1 组长节流、metrics token 计量（`agentmesh stats` leaderShare）。
+- **任务**：`v05-recon-loans` 借阅管理模块（纯 Node.js ESM，零依赖、禁网络）：R1 库存不足拒绝（INSUFFICIENT_STOCK）、R2 ISBN 13 位校验（ValidationError）、R3 逾期罚金 0.5 元/天、R4 suspended 会员拒绝、R5 VIP/普通借阅上限 8/5、R6 主观项"查询接口要好用直观"（`summarizeLoans`）。
+- **环境隔离**：工作区 `D:\temp_pip\opencode\v05-recon-test`（独立 git 仓库：需求文档.md + requirements.json + spec.json）；数据根 `D:\temp_pip\opencode\v05-recon-home`；证据目录 `v05-recon-evidence`。驱动脚本 `smoke-v05.mjs` 从当前 dist 另起 StdioClientTransport 桥（组长自用桥是 v0.5 前旧代码，工具契约不含 `requirementsPath`/`needs_ruling`，不得混用），并在任何派发前校验 `run_workflow` description 含 `needs_ruling` 防旧桥误耗配额。
+- **角色**：worker/tester = `opencode/nemotron-3.5-lightning-free`；reviewer 初始同 nemotron，Run #4 后换 `opencode/mimo-v2.5-free`（见问题清单）。三阶段：implement(worker, R1-R6) → review(reviewer, maxReworkRounds=1) → verify(tester, R1-R5)，验收命令 `node --test` + covers 声明。
+
+## 1. 执行轨迹（6 runs，全部真实消耗）
+
+| Run | workflowId          | 终态             | 时长   | 触发原因 / 验证点                                                                                                                                                                                                 |
+| --- | ------------------- | ---------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| #1  | —（schema 拒绝）    | —                | <1min  | spec 顶层 `policy` 被 strict schema 拒绝：设计文档 §4.3 示例错误，实现契约为 per-stage policy（文档已修正）                                                                                                       |
+| #2  | wf_mtrg2eal96141a55 | escalated        | 15s    | glm-5.3-flash 预扣费制 403 `VENDOR_QUOTA`（余额 0.04 < 预扣 0.05）→ fail-closed 升级 ✓；附带验证 compact 封套（385-593B）、Tier 0 落盘、escalated 下 ledger 全行 ESCALATED + invariant 6/6                        |
+| #3  | wf_mtrg44lob8dddcc7 | escalated        | 10m00s | 验收命令 `node --test tests/` 在 Windows Node 22.23 把目录参数当 CJS 入口解析（组长 spec 适配错误，非 worker 缺陷）→ fail-closed ✓；worker 交付实际完好（3 测试文件全绿）                                         |
+| #4  | wf_mtrzc1ugdf99c45c | escalated        | 11m17s | nemotron reviewer 整轮零 `type:"text"` 事件 → 严格契约 UNKNOWN → fail-closed ✓；ledger R1-R6 全行 PENDING_RULING + invariant 6/6                                                                                  |
+| #5  | wf_mtrzuqed946c47f0 | **needs_ruling** | 14m28s | 全链路通过：review 经 rework 环（FAIL→修复→复审 PASS）；R1-R5=PASS（covering 命令 + 跨 stage 合取），R6=PENDING_RULING（主观项无证据路径）→ 终态翻转为 needs_ruling 而非 done，coverage "5/6（1 PENDING_RULING）" |
+| #6  | wf_mts0iaza0abbe274 | **done**         | 10m26s | 组长裁决 R6（主观项 EARS 改写为 summarizeLoans 契约 + 补 covers 声明，commit `767b01e`）→ 重跑 → 6/6 全 PASS、invariant ok                                                                                        |
+
+Run #1 未创建 workflow 即被拒，零配额消耗；#2-#4 是三轮"失败注入"——两轮组长侧失误、一轮 vendor 模型行为，引擎全部按 fail-closed 语义正确升级，恰好构成对账单异常路径的覆盖。
+
+## 2. Token 与时长（12 dispatches，合计 700,788 tokens，全免费档）
+
+| Run | worker（in+out / 时长）                                         | reviewer（in+out / 时长）                                    | tester（in+out / 时长） |
+| --- | --------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------- |
+| #2  | 0+0（14s，vendor 拒绝）                                         | —                                                            | —                       |
+| #3  | 161,498+6,611 / 598s                                            | —                                                            | —                       |
+| #4  | 102,532+2,712 / 296s                                            | 25,972+701 / 377s（error）                                   | —                       |
+| #5  | 38,121+1,843 / 177s（implement）+ 63,003+1,297 / 172s（rework） | 25,777+4,425 / 132s（FAIL）+ 27,877+1,793 / 71s（复审 PASS） | 92,933+2,978 / 308s     |
+| #6  | 74,354+1,564 / 230s                                             | 8,832+10,344 / 145s                                          | 43,533+2,038 / 245s     |
+
+- 计量链路（#0 metrics）真实开火：`metrics.jsonl` 12 行逐 dispatch 记录 tokensIn/Out/durationMs/outcome/model，`agentmesh stats` 可聚合。
+- 主模型（组长）本轮会话合计 input 840,844 / output 78,991 / reasoning 56,599 ≈ 976K tokens（含前半场 Batch 1 编码，无法精确切分测试段；cache read 48.3M 未计入）——远超 worker 单轮量级，P-080 组长占比问题在"开发+测试混合会话"场景依然成立。
+
+## 3. 五问结论
+
+### 3.1 小任务是在做什么
+
+见 §0 测试设计：借阅管理模块三阶段 workflow，requirements.json 六条 EARS 条目（quote 均为需求文档.md 真实子串，引擎 substring 核验通过）贯穿 implement→review→verify，终态由 ledger 对账决定。组长负责 spec/requirements 编写、失败裁决（Run #3 验收命令修正、Run #4 换 reviewer 模型、Run #6 R6 裁决）。
+
+### 3.2 上下文是否损失及程度
+
+- **compact 封套（P-080①）：无损**。默认轮询返回 385-593B 状态枚举 + flag 位 + ledger 指针，结论性信息完整；全量快照按需 `detail:"full"` 获取，未见字段缺失。
+- **Tier 0 落盘（P-080②）：无损**。>2KB 返回体自动落盘 `<home>/out/`，只回尾部 + 路径；Run #5 终态全量快照（含 6 行 ledger 证据）落盘 `workflow_wf_mtrzuqed946c47f0_full.txt` 可复核，尾部摘要足够裁决。
+- **Tier 1 归档：语义精确**。Run #5 终态后 worker/reviewer 会话全占位归档（archivedTurns 2/2/1）、末 stage tester 会话最新轮原样保留（kept:true, lastTurnIntact:true）——"非末位会话全归档、末位会话保最新轮"的设计语义实测成立。
+- **rework 轮会话复用：无损**。Run #5 review 阶段三任务共享 worker 会话（implement 与 rework 同 sessionId），findings 注回未开新会话。
+- **requirements 贯穿：无损**。六条 EARS+quote 从 requirements.json 逐条进 ledger 行，R1-R5 的跨 stage 合取（implement+verify 双命令证据）正确归并。
+
+### 3.3 是否重复做无意义操作
+
+- **Run #3 整轮浪费（约 168K tokens / 10min）**：根因是组长写 spec 时验收命令未在目标平台本地验证——worker 交付完好却被 fail-closed。纪律沉淀：**组长出 spec 前必须本地跑通验收命令**。
+- **Run #4 部分浪费（reviewer 一轮，约 27K tokens）**：nemotron 零 text 事件属 vendor 免费档行为不稳定（r19/r21 同源），非链路缺陷；fail-closed 拒判正确。
+- **Run #5→#6 全量重跑（约 140K tokens）**：裁决 R6 后整个 workflow 从头跑，已 passed 的 implement/review 重复消耗——这是 P-079（无 `--resume` 断点续跑）在 v0.5 场景的直接复现，对账单架构下"只重出 ledger 不重跑 stage"的诉求更强。
+- **必要不重复**：verify 阶段 tester 独立运行验收命令是角色设计；Run #6 review 直接 PASS 无 rework，无空转。
+
+### 3.4 暴露的问题
+
+| #       | 问题                                                                                                                              | 根因                                                                                                                 | 影响                                                                                | 证据                                                                               | 建议修复                                                                        |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| P-R22-1 | reviewer 零 text 事件时 task summary 回退为原始 JSONL 事件碎片（已立案 P-081）                                                    | `normalizeResult` 的 summary 回退链 finalAnswer 为空时落到原始 stdout，`pickSummaryLine` 把 step_finish 事件行当摘要 | 诊断误导（初看像"适配器把 step_finish 当最终回答"）；status/终态/ledger 语义无误    | `tasks/wf_mtrzc1ugdf99c45c_s1_2.result.json` summary 字段携带完整 step_finish JSON | 见 PROBLEMS.md P-081                                                            |
+| P-R22-2 | 设计文档 §4.3 spec 示例带顶层 `policy`，实现契约为 per-stage（strict schema 拒绝）                                                | 文档先行、实现收紧时未回改示例                                                                                       | 首次提交即被拒（本轮 Run #1）；已修正文档并加注                                     | Run #1 报错 + `0dba9c7`                                                            | 已修复（文档）                                                                  |
+| P-R22-3 | 裁决后只能全量重跑，无 ledger 单独重出                                                                                            | P-079 断点续跑未落地；v0.5 未提供"只重算对账"通道                                                                    | Run #6 重复消耗 implement/review 约 140K tokens（免费档无费用，付费模型即真实成本） | Run #5→#6 metrics 对比                                                             | P-079 `--resume` 落地；或提供 `recompute_ledger(workflowId)` 裁决后仅重出对账单 |
+| P-R22-4 | vendor 预扣费制配额墙：glm-5.3-flash 余额 0.04 < 预扣 0.05 即 403                                                                 | opencode 默认模型为付费档（预扣费），账户余额不足                                                                    | 首轮即 escalated（fail-closed 行为正确，属环境事实非缺陷）                          | Run #2 worker dispatch 0 token + error                                             | 角色配置显式钉免费档（本轮已按此执行，`ba92b65`）                               |
+| P-R22-5 | 组长工具性失误 3 起：PS 5.1 `Set-Content -Encoding utf8` 写入 BOM 致 JSON.parse 拒绝（两次）、命令顺序失误、宿主 30s 掐断后台驱动 | 组长对 Windows 工具链细节不熟；宿主同步命令超时限制（P-R14-4 已知）                                                  | 每次 1-2 轮返工；BOM 排查耗时                                                       | `805e8af`/`f755b7d` 两次提交                                                       | 写 JSON 一律走 write 工具或 node（无 BOM）；长驱动一律 nohup 式后台 + 轮询      |
+
+### 3.5 资源与清理
+
+- **产物保留**：`D:\temp_pip\opencode\v05-recon-test`（git 仓库，8 个提交含全部裁决轨迹）、`v05-recon-home`（workflows/metrics/sessions/tasks/out 全量）、`v05-recon-evidence`（驱动取证文件）；驱动脚本 `smoke-v05.mjs` 在主仓库（未提交，随 v0.5 分支待入库）。
+- **进程**：三个驱动进程（32808/16072/32628）均正常退出；机器上存留多个跨会话 `agentmesh serve` 桥进程（最早 9/7），归属无法与本轮精确区分，为避免误伤其他会话未做清理。
+- **未采集项**：CPU/RSS 未采样，不做零值虚报；opencode 子进程级资源由 vendor 侧管理。
+
+## 本轮结论
+
+**v0.5 Batch 1 核心闭环全链路验证成功，且失败路径覆盖完整**：
+
+1. **对账单语义正确**：R1-R5 经 covering 命令 + 跨 stage 合取判 PASS；R6 主观项无证据路径 → PENDING_RULING → 终态 `needs_ruling`（而非 done）——"需求条目不因阶段全绿就放行"的 fail-closed 设计实测成立。
+2. **组长裁决闭环成立**：Run #6 将 R6 改写为可判定 EARS + 补 covers 声明后重跑，终态 `done`、coverage 6/6、ledger 全行 PASS、invariant ok——需求→实现→证据→裁决→再对账的完整回路走通。
+3. **四类异常全部正确升级**：schema 拒绝、vendor 配额、验收失败、评审 UNKNOWN——无一被粉饰为 done，ledger 行状态与 invariant 检查在每条路径上都说了真话。
+4. **节流机制真实生效**：compact 封套把组长轮询负载从全量快照压到数百字节；Tier 0 落盘五次触发均可回溯；Tier 1 归档语义精确。
+5. **遗留**：P-081（summary 碎片）与 P-079 复现（裁决后全量重跑）为主要待修项；组长消耗（≈976K，含开发段）仍显著高于单 worker 轮，P-080 的 Batch 2/3（副官工具、终态推送）有明确落点。

@@ -257,7 +257,16 @@ describe("runner budget gate (P5 T5.4)", () => {
   });
 
   afterEach(() => {
-    for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0))
+      fs.rmSync(dir, {
+        recursive: true,
+        force: true,
+        // Windows: a just-exited git child can briefly hold the repo dir
+        // (EBUSY); retry briefly before giving up. Under the full suite the
+        // stall can outlast 1s, so keep a ~10s budget.
+        maxRetries: 50,
+        retryDelay: 200,
+      });
   });
 
   it("fails a new dispatch with BUDGET_EXHAUSTED once the cap is reached under rejectNew", async () => {
@@ -333,7 +342,16 @@ describe("reviewChanges rework loop (P5 T5.1)", () => {
   });
 
   afterEach(() => {
-    for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0))
+      fs.rmSync(dir, {
+        recursive: true,
+        force: true,
+        // Windows: a just-exited git child can briefly hold the repo dir
+        // (EBUSY); retry briefly before giving up. Under the full suite the
+        // stall can outlast 1s, so keep a ~10s budget.
+        maxRetries: 50,
+        retryDelay: 200,
+      });
   });
 
   it("maxReworkRounds=0 keeps the v0.1 single-pass behavior", async () => {
@@ -382,7 +400,11 @@ describe("reviewChanges rework loop (P5 T5.1)", () => {
     expect(reviewer.runs).toBe(2);
   });
 
-  it("stops with evidence when rounds are exhausted", async () => {
+  // Four scripted review rounds with real git commits — the slowest test in
+  // this file. Under the full suite (coverage + parallel workers) it can
+  // exceed the 20s default; a timeout here would also leave reviewChanges git
+  // children running and lock the repo for afterEach cleanup (EBUSY).
+  it("stops with evidence when rounds are exhausted", { timeout: 60_000 }, async () => {
     for (let i = 0; i < 4; i++) reviewer.enqueue(FAIL_TURN);
     const workerSession = sessionManager.createSession({
       agent: "claude",
@@ -507,7 +529,16 @@ describe("continueTask fromCheckpoint (P5 T5.2)", () => {
   });
 
   afterEach(() => {
-    for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0))
+      fs.rmSync(dir, {
+        recursive: true,
+        force: true,
+        // Windows: a just-exited git child can briefly hold the repo dir
+        // (EBUSY); retry briefly before giving up. Under the full suite the
+        // stall can outlast 1s, so keep a ~10s budget.
+        maxRetries: 50,
+        retryDelay: 200,
+      });
   });
 
   it("injects the salvaged output and consumes the baton once", async () => {

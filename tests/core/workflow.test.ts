@@ -710,6 +710,228 @@ describe("core/workflow (M4 deterministic orchestration state machine)", () => {
   it("reports an unknown workflow id as absent from the state log", () => {
     expect(readPersistedWorkflowSnapshot("wf_missing", { homeDir })).toBeUndefined();
   });
+
+  describe("v0.5 reconciliation ledger + needs_ruling + Tier 1 archive", () => {
+    const requirements = {
+      source: "doc.md",
+      items: [
+        {
+          id: "R1",
+          ears: "The system SHALL build the widget",
+          kind: "unconditional" as const,
+          quote: "build the widget",
+          decidable: true,
+        },
+        {
+          id: "R2",
+          ears: null,
+          kind: null,
+          quote: "要好看",
+          decidable: false,
+        },
+      ],
+    };
+
+    it("terminates as needs_ruling when undecidable rows remain and persists the ledger", async () => {
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const archiveCalls: Array<{ archive: string[]; keep: string[]; ledgerRef: string }> = [];
+      const engine = makeEngine(
+        {
+          name: "reconciled",
+          stages: [
+            {
+              name: "implement",
+              roles: ["worker"],
+              requirements: ["R1", "R2"],
+              dispatch: { agent: "codex", taskTemplate: "build" },
+              acceptance: {
+                // R1 covered; R2 declared without covering command → PENDING_RULING.
+                commands: [{ cmd: `node -e "process.exit(0)"`, covers: ["R1"] }],
+              },
+            },
+          ],
+        },
+        dispatch,
+        {
+          requirements,
+          archiveSessions: (params) => {
+            archiveCalls.push({
+              archive: params.archiveSessionIds,
+              keep: params.keepSessionIds,
+              ledgerRef: params.ledgerRef,
+            });
+            return Promise.resolve({ archived: params.archiveSessionIds.length });
+          },
+        },
+      );
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("needs_ruling");
+      expect(snapshot.needsRulingIds).toEqual(["R2"]);
+      expect(snapshot.ledgerRef).toBe(
+        path.join(homeDir, "out", `ledger_${snapshot.workflowId}.json`),
+      );
+      const ledger = JSON.parse(fs.readFileSync(snapshot.ledgerRef!, "utf-8")) as {
+        rows: Array<{ id: string; status: string; ears: string }>;
+        invariant: { requirements: number; rows: number; ok: boolean };
+      };
+      expect(ledger.rows).toHaveLength(2);
+      expect(ledger.rows.find((row) => row.id === "R1")).toMatchObject({ status: "PASS" });
+      expect(ledger.rows.find((row) => row.id === "R2")).toMatchObject({
+        status: "PENDING_RULING",
+        ears: "要好看",
+      });
+      expect(ledger.invariant).toEqual({ requirements: 2, rows: 2, ok: true });
+
+      // Tier 1 archive: the workflow's only stage is also the last stage, so
+      // its sessions are kept (nothing to archive) — no archive call fires.
+      expect(archiveCalls).toHaveLength(0);
+    });
+
+    it("stays done when every declared row carries covering command evidence", async () => {
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const engine = makeEngine(
+        {
+          name: "fully-covered",
+          stages: [
+            {
+              name: "implement",
+              roles: ["worker"],
+              requirements: ["R1", "R2"],
+              dispatch: { agent: "codex", taskTemplate: "build" },
+              acceptance: {
+                commands: [
+                  { cmd: `node -e "process.exit(0)"`, covers: ["R1"] },
+                  { cmd: `node -e "process.exit(0)"`, covers: ["R2"] },
+                ],
+              },
+            },
+          ],
+        },
+        dispatch,
+        { requirements },
+      );
+
+      const snapshot = await engine.run();
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.needsRulingIds).toBeUndefined();
+      const ledger = JSON.parse(fs.readFileSync(snapshot.ledgerRef!, "utf-8")) as {
+        rows: Array<{ id: string; status: string }>;
+      };
+      expect(ledger.rows.map((row) => row.status)).toEqual(["PASS", "PASS"]);
+    });
+
+    it("normalizes legacy string acceptance commands and keeps covers off the record", async () => {
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const engine = makeEngine(
+        {
+          name: "legacy-commands",
+          stages: [
+            {
+              name: "implement",
+              roles: ["worker"],
+              dispatch: { agent: "codex", taskTemplate: "build" },
+              acceptance: { commands: [`node -e "process.exit(0)"`] },
+            },
+          ],
+        },
+        dispatch,
+      );
+
+      const snapshot = await engine.run();
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.stages[0]!.acceptance!.commands[0]!.covers).toBeUndefined();
+    });
+
+    it("archives the previous stage's sessions and keeps the last stage's newest turn", async () => {
+      let sessionSeq = 0;
+      const dispatch = new FakeDispatchService().script(() =>
+        okResult({ sessionId: `sess_arch_${(sessionSeq += 1)}` }),
+      );
+      const archiveCalls: Array<{ archive: string[]; keep: string[] }> = [];
+      const engine = makeEngine(
+        {
+          name: "archived",
+          stages: [
+            { name: "s1", roles: ["worker"], dispatch: { agent: "codex", taskTemplate: "one" } },
+            { name: "s2", roles: ["worker"], dispatch: { agent: "codex", taskTemplate: "two" } },
+          ],
+        },
+        dispatch,
+        {
+          archiveSessions: (params) => {
+            archiveCalls.push({ archive: params.archiveSessionIds, keep: params.keepSessionIds });
+            return Promise.resolve({ archived: params.archiveSessionIds.length });
+          },
+        },
+      );
+
+      const snapshot = await engine.run();
+      expect(snapshot.status).toBe("done");
+      expect(archiveCalls).toHaveLength(1);
+      const [s1Session, s2Session] = snapshot.stages.map((stage) => stage.sessionIds[0]!);
+      expect(archiveCalls[0]!.archive).toEqual([s1Session]);
+      expect(archiveCalls[0]!.keep).toEqual([s2Session]);
+    });
+  });
+
+  // P-079②: a resumed run inherits already-passed stage records from the
+  // prior terminal snapshot and re-dispatches ONLY the pending stages.
+  describe("resume (P-079② checkpoint resume)", () => {
+    const twoStageSpec: WorkflowSpec = {
+      name: "resumable",
+      stages: [
+        { name: "s1", roles: ["worker"], dispatch: { agent: "codex", taskTemplate: "one" } },
+        { name: "s2", roles: ["worker"], dispatch: { agent: "codex", taskTemplate: "two" } },
+      ],
+    };
+
+    it("skips passed stages and re-runs only pending ones", async () => {
+      // First run: s1 passes, s2 dispatch-fails → terminal escalated
+      // (fail-closed default policy.escalateOn="any").
+      const first = new FakeDispatchService()
+        .script(() => okResult())
+        .script(() => failResult({ error: "vendor 503" }));
+      const firstEngine = makeEngine(twoStageSpec, first);
+      const firstSnapshot = await firstEngine.run();
+      expect(firstSnapshot.status).toBe("escalated");
+      expect(firstSnapshot.stages.map((s) => s.status)).toEqual(["passed", "escalated"]);
+
+      const persisted = readPersistedWorkflowSnapshot(firstSnapshot.workflowId, { homeDir });
+      expect(persisted).toBeDefined();
+
+      // Resumed run: only s2 re-dispatches; s1 is inherited as passed.
+      const second = new FakeDispatchService().script(() => okResult());
+      const secondEngine = makeEngine(twoStageSpec, second, { resumeSnapshot: persisted });
+      const snapshot = await secondEngine.run();
+
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.stages.map((s) => s.status)).toEqual(["passed", "passed"]);
+      expect(second.calls).toHaveLength(1);
+      expect(second.calls[0]!.task).toBe("two");
+    });
+
+    it("ignores a resume snapshot from a DIFFERENT spec name and runs everything", async () => {
+      const first = new FakeDispatchService().script(() => okResult());
+      const firstEngine = makeEngine(
+        {
+          name: "other-spec",
+          stages: [
+            { name: "s1", roles: ["worker"], dispatch: { agent: "codex", taskTemplate: "x" } },
+          ],
+        },
+        first,
+      );
+      const firstSnapshot = await firstEngine.run();
+      const persisted = readPersistedWorkflowSnapshot(firstSnapshot.workflowId, { homeDir });
+
+      const second = new FakeDispatchService().script(() => okResult());
+      const snapshot = await makeEngine(twoStageSpec, second, { resumeSnapshot: persisted }).run();
+      expect(snapshot.status).toBe("done");
+      expect(second.calls).toHaveLength(2);
+    });
+  });
 });
 
 /** Counts rework rounds across a snapshot (evidence chain sanity helper). */

@@ -793,7 +793,7 @@
 
 **解决方法**：① dispatchWithReRoute 对 isRetryable TRANSIENT 失败增加有界指数退避重试（如 `policy.retryTransient`，默认 1 次）；② `workflow run --resume <workflowId>` 从已持久化 checkpoint 恢复，仅执行 pending 阶段，跳过已 passed 阶段。
 
-**状态**：未修复（2026-09-04 立案；证据 = wf_mtlr056zb5ab8b69 ESCALATED 链 + metrics.jsonl 503 记录；本次以人工裁剪 spec 变体 wf_mtlrioind5ae1847 恢复闭环）
+**状态**：已修复（2026-09-08）。②断点续跑：`run_workflow` MCP 增 `resumeFromWorkflowId`、CLI `workflow run --resume <workflowId>`，从持久化 snapshot 继承 passed 阶段（同 spec 名硬校验，异名直接拒绝），仅重新执行 pending 阶段；workflow.test.ts 正反两个回归用例覆盖（跳过 passed 只重跑 pending / 异名 snapshot 全量照跑）。①瞬态重试：机制层本就存在——`BaseAdapter.run` 经 `executeWithResilientRetries` 对 TRANSIENT_5XX 无产出失败自动重试（≤3 次，5s/15s/45s 退避）；当时未生效的真正根因是 P-078（错误被压成裸 APIError 无法分类）而非缺重试层。本轮补齐最后一环：`classifyErrorCode` 直接消费 `httpStatus`（408/429/5xx → TRANSIENT_5XX，即使 message 无任何特征词），opencode 解析出的 HTTP 状态码已喂入分类器，resilience.test.ts 回归覆盖。僵尸任务处理由 startup orphan sweep + P-R15-1 dead-letter（此前版本已落地）承担。
 
 ## P-080 组长（主模型 Orchestrator）上下文节流依赖纪律无引擎默认值，消耗占比失控（newsradar 项目实测 3-4 倍于 worker）
 
@@ -803,4 +803,14 @@
 
 **解决方法**：①get_workflow/poll_task/escalated 证据链默认 compact 模式（状态枚举+结论性摘要+证据文件指针），`detail:"full"` 显式才给全量；②面向组长的返回体超过 2KB 自动落盘 out/ 并只回尾部 1.5KB+路径（把 tail-2KB 惯例升级为引擎行为）；③新增组长副官工具 `summarize_for_leader(target, focusQuestion)`——免费模型预读大文件/长输出只回 ≤300 字答案+指针，组长物理上不接触大块内容；④stats 增加 leaderShare 派生指标（组长消耗/项目总消耗），超 25% 阈值告警；⑤终态经 MCP notifications 主动推送替代轮询。落地优先级：①②（引擎小改收益最大）→ ③（新增角色）→ ④⑤（增强）。
 
-**状态**：未修复，v0.5 设计已定稿（2026-09-07 立案；证据 = newsradar 项目组长/worker 消耗比 3-4 倍 + r17 轮 6.83M tokens 事后复盘；预期方案①②③落地后组长占比压回 15% 以内。设计定稿见 `v0.5_设计_需求对账单架构.md`：①②落 Batch 1、③即副官工具（Batch 2）、④⑤落 Batch 3，并吸收前人方案补两层归档——Tier1 规则化清场（workflow 终态占位符归档，零 token，参照 ClaudeCode microcompact）先于 Tier2 LLM 压缩阈值兜底）
+**状态**：部分修复（2026-09-08，v0.5 Batch 1 落地①②④）。①get*workflow/poll_task 默认 compact 封套（状态枚举+flag 位+ledger 指针），`detail:"full"` 显式取全量；②面向组长的返回体 >2KB 自动落盘 `<agentmeshHome>/out/` 只回尾部 1.5KB+路径（Tier 0，无条件引擎行为，含全量模式）；④`agentmesh stats --leader-tokens <n>` 计算 leaderShare 并在 >25% 时输出 LEADER_SHARE_EXCEEDED 告警（组长侧消耗由宿主提供，引擎不 meter 宿主、不伪造估计）。同批搭载 v0.5 对账单核心：requirements.json（EARS+quote 机械核验）、终态 ledger（out/ledger*\*.json，invariant 硬检查，PENDING*RULING → needs_ruling 终态）、Tier 1 会话占位符归档（仅 AgentMesh 侧）。③副官工具落 Batch 2、⑤终态推送落 Batch 3（见 `v0.5*设计\_需求对账单架构.md` §9）；组长占比目标（Batch 1 后 ≤40-50%）待下一项目 A/B 实测。
+
+## P-081 opencode 通道零 text 事件时 task summary 回退为原始 JSONL 事件碎片，污染失败可观测性（v0.5 真实测试 Run #4）
+
+**问题**：v0.5 对账单真实测试 Run #4（wf_mtrzc1ugdf99c45c）review 阶段，opencode reviewer（`opencode/nemotron-3.5-lightning-free`）整轮零 `type:"text"` 事件（仅 `step_finish`），引擎侧结果为 `status:"failed"`、`exitCode:0`、`summary` 是原始 JSONL 事件碎片（`{"type":"step_finish","timestamp":...,"part":{...}}`）。严格评审契约（reviewVerdictRequired）正确判 UNKNOWN → fail-closed 升级，终态与 ledger 语义无误；但 summary 以 vendor 事件流片段冒充人类可读摘要，诊断时极易误读为"适配器把 step_finish 当最终回答"，误导排查方向（本轮实际排查耗时即源于此）。
+
+**根因**：opencode 适配器 `parseOpenCodeJsonLines` 在无 text 事件时 `output=""`、`finalAnswer=undefined`（正确）；但 `BaseAdapter.normalizeResult` 的 summary 回退链是 `extractSummary(options?.finalAnswer || output)`——finalAnswer 为空时落到**原始进程 stdout**，`extractSummary` 的 `pickSummaryLine` 从 JSONL 逐行里挑出第一条"有意义"行（即 step_finish 事件），把 vendor 事件行当摘要返回。适配器边界缺少"规范化输出为空但事件流已解析"的显式信号，摘要回退不知道该停在空串/占位说明。
+
+**解决方法**：① summary 回退链对 JSONL 类 stdout（首行可 JSON.parse 且含 `type` 字段）不做逐行挑选，直接返回角色化占位说明（如 "no normalized answer produced (0 text events)"）；② 或适配器在 parsedAny=true 且 answers 为空时于 result 上显式携带 `emptyReason`，normalizeResult 优先消费它；③ 排障侧：reviewer UNKNOWN + exitCode 0 + summary 为 JSON 碎片三特征齐现时，应直接怀疑 vendor 零 text 输出（本条为诊断捷径，非代码修复）。
+
+**状态**：已修复（2026-09-08）——`parseOpenCodeJsonLines` 在"解析到事件流但零 text 回答"时显式携带 `normalizedEmpty: true`；适配器结果链路消费该信号，summary 用角色化占位符 `OPENCODE_NO_ANSWER_PLACEHOLDER`（"(no normalized answer produced: the vendor run emitted 0 text events)"）替代原始 stdout，并追加 P-081 warning 说明，JSONL 事件碎片不再冒充人类可读摘要。同轮次姊妹问题（nemotron reviewer 零 text 输出本身是免费档模型行为不稳定）维持原诊断：换 reviewer 模型（mimo-v2.5-free）后正常，属模型选型问题非代码缺陷。
