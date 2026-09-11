@@ -1,10 +1,12 @@
 # AgentMesh (Multi-Agent Bridge & Network)
 
-> **把不同厂商的第一方 AI Coding Agent 统一暴露为标准 MCP Tools 的本地编排网格。**
- **一句话明白 AgentMesh 是干什么的：**  
-> **AgentMesh 把不同的 AI 编程助手（Codex、Claude Code、Antigravity、OpenCode 等）组建为一个“AI 软件开发团队” —— 让主控 AI 像项目经理一样，调度其他 AI 分别担任程序员（写代码）、代码审查员（只读审查）和测试员（跑测试），自动协同完成复杂的编程任务。**
+**一句话明白 AgentMesh 是干什么的：**  
+> AgentMesh 把不同的 AI 编程助手（Codex、Claude Code、Antigravity、OpenCode 等）组建为一个“AI 软件开发团队” —— 让主控 AI 像项目经理一样，调度其他 AI 分别担任程序员（写代码）、代码审查员（只读审查）和测试员（跑测试），自动协同完成复杂的编程任务。
+
 AgentMesh 是一个本地 **MCP 桥接网格**。主控 Agent（如 Antigravity / Codex）可通过标准 MCP 工具统一调度异构 Agent，按 **Worker（实现）**、**Reviewer（只读审查）**、**Tester（验证）** 角色分工协同，保留各厂商原生的 Harness、工具链与订阅配额，完成复杂需求的开发与验证闭环。
+
 ---
+
 
 ## 💡 解决的核心痛点
 
