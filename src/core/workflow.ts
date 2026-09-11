@@ -25,7 +25,7 @@ import {
   resolveAgentHealthCandidate,
 } from "./health.js";
 import type { HealthWeightedCandidate } from "./health.js";
-import type { ErrorCode } from "./types.js";
+import type { ErrorCode, RepositoryStateEvidence } from "./types.js";
 import type { BackgroundDispatchService } from "../mcp/tools.js";
 import type { StoredTaskResult } from "./background.js";
 import {
@@ -37,6 +37,14 @@ import {
 import type { RequirementsFile } from "./requirements.js";
 import { buildLedger, needsRuling, pendingRulingIds } from "./ledger.js";
 import type { AgentMeshEventBus } from "./events.js";
+import type { WorkflowLane } from "./metrics.js";
+import {
+  resolveRunLane,
+  triageWorkflow,
+  shouldSampleStage,
+  DEFAULT_SAMPLING_RATE,
+} from "./triage.js";
+import type { TriageDecision } from "./triage.js";
 
 /**
  * M4 deterministic orchestration state machine (ROADMAP_v0.4 M4).
@@ -238,6 +246,14 @@ export const WorkflowSpecSchema = z
   .object({
     name: z.string().trim().min(1).max(200),
     stages: z.array(StageSpecSchema).min(1).max(32),
+    gateRuling: z
+      .enum(["standard", "full"])
+      .optional()
+      .describe(
+        "v0.5 Batch 2 #8 gated-gateway ruling: when the triage engine assigns the gated lane, " +
+          "a spec without this leader ruling fails closed before any dispatch " +
+          "(GATE_RULING_REQUIRED); with it, the run's lane takes the ruling value",
+      ),
   })
   .strict();
 
@@ -311,6 +327,18 @@ export interface WorkflowReworkRoundRecord {
   findings: ReviewFinding[];
 }
 
+/**
+ * Batch 2 #9 lane events (design §5): tree-guard upgrades and sampled reviews
+ * are recorded per stage and surface in the terminal ledger anomalies and the
+ * compact envelope flags — the audit trail for mid-run lane changes.
+ */
+export interface WorkflowLaneEvent {
+  at: string;
+  stage: string;
+  event: "tree-guard-upgrade" | "sampled-review";
+  detail: string;
+}
+
 export interface WorkflowStageRecord {
   name: string;
   index: number;
@@ -333,6 +361,27 @@ export interface WorkflowStageRecord {
   workerSessionId?: string;
   /** All Bridge sessions produced by this stage's successful dispatches (upstream sources). */
   sessionIds: string[];
+  /**
+   * Batch 2 #9 tree guard (fast lane): out-of-scope write detection against
+   * the stage's declared acceptance.files. `checked:false` records the honest
+   * reason the guard could not run (no git work tree / fingerprints degraded).
+   */
+  treeGuard?: {
+    checked: boolean;
+    outOfScopePaths: string[];
+    /** True when the guard detected violations and the stage was upgraded in place. */
+    upgraded?: boolean;
+    note?: string;
+  };
+  /**
+   * Batch 2 #9 sampled post-acceptance review (fast lane): the seeded 10-20%
+   * audit verdict. A non-PASS verdict fails the stage (fail-closed) — sampled
+   * findings are the manual triage-tuning feedback channel (design §5 #14).
+   */
+  sampleReview?: {
+    verdict: "PASS" | "FAIL" | "UNKNOWN";
+    findings: ReviewFinding[];
+  };
   error?: string;
   startedAt?: string;
   updatedAt: string;
@@ -361,9 +410,13 @@ export interface WorkflowSnapshot {
   workflowId: string;
   name: string;
   status: WorkflowOverallStatus;
+  /** v0.5 Batch 2 #8: effective triage lane for this run (gated + gateRuling → ruling value). */
+  lane?: WorkflowLane;
+  /** Batch 2 #9: mid-run lane events (tree-guard upgrades, sampled reviews), in order. */
+  laneEvents?: WorkflowLaneEvent[];
   stages: WorkflowStageRecord[];
   evidence?: WorkflowEvidence;
-  failure?: { stageName: string; reason: string; finalError?: string };
+  failure?: { stageName: string; reason: string; finalError?: string; errorCode?: string };
   /** Absolute path of the terminal reconciliation ledger (v0.5, out/ directory). */
   ledgerRef?: string;
   /** Requirement ids still awaiting leader ruling when status is needs_ruling. */
@@ -408,6 +461,13 @@ export interface WorkflowEngineOptions {
    * as the row universe. Absent → no ledger is produced (legacy behavior).
    */
   requirements?: RequirementsFile;
+  /**
+   * Batch 2 #9: fast-lane sampled-review ratio (design §5, fixed 10-20% band).
+   * 0 disables sampling entirely; defaults to DEFAULT_SAMPLING_RATE (0.15).
+   * The MCP layer clamps the exposed parameter to the design band; the engine
+   * accepts the full 0..1 range so tests can pin both extremes.
+   */
+  samplingRate?: number;
   /**
    * v0.5 Tier 1 rule-based archive (design §6): invoked once at workflow
    * terminal with every Bridge session the workflow produced. Best-effort —
@@ -550,6 +610,47 @@ function truncateSummary(summary: string): string {
   return truncateText(summary, MAX_UPSTREAM_SUMMARY_CHARS);
 }
 
+/** Slash-normalized, lower-cased path form for guard scope comparisons. */
+function normalizeGuardPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/** Prefix/exact matcher over repo-relative paths; directories match their subtree. */
+function isPathWithinScope(filePath: string, scopes: readonly string[]): boolean {
+  const normalized = normalizeGuardPath(filePath);
+  return scopes.some((scope) => {
+    const candidate = normalizeGuardPath(scope);
+    return normalized === candidate || normalized.startsWith(`${candidate}/`);
+  });
+}
+
+/**
+ * Resolves a stage-declared (cwd-relative) file into a repo-root-relative
+ * scope path for the tree guard. Returns undefined when the declaration
+ * escapes the repository — such paths can never match git evidence anyway.
+ */
+function toRepoRelativeScope(
+  repositoryRoot: string,
+  cwd: string,
+  declaredFile: string,
+): string | undefined {
+  const absolute = path.isAbsolute(declaredFile) ? declaredFile : path.resolve(cwd, declaredFile);
+  const relative = path.relative(repositoryRoot, absolute);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) return undefined;
+  return relative;
+}
+
+/** Read-only review briefing for a tree-guard upgrade (no destructive guidance). */
+function buildTreeGuardReviewPrompt(stageName: string, outOfScopePaths: string[]): string {
+  return (
+    `Tree-guard upgrade review of stage '${stageName}': the worker wrote file(s) outside the ` +
+    "stage's declared file set (listed below). Review the stage's changes with special attention " +
+    "to these out-of-scope paths — whether they are legitimate, consistent, and free of defects — " +
+    "and end with your verdict. Out-of-scope paths:\n" +
+    outOfScopePaths.map((filePath) => `- ${filePath}`).join("\n")
+  );
+}
+
 /** Resolves the workflows.jsonl path exactly like the metrics file resolution. */
 export function resolveWorkflowFilePath(homeDir?: string): string {
   return homeWorkflowsFilePath(homeDir ?? resolveAgentMeshHome());
@@ -664,6 +765,8 @@ interface DispatchRequest {
   group?: string;
   timeoutMs?: number;
   mode?: TransportMode;
+  /** Batch 2 #8: triage lane stamped onto every stage dispatch for metrics. */
+  lane?: WorkflowLane;
   /** Agent attempted before this dispatch when re-routed after a stall (M2). */
   reroutedFrom?: string;
 }
@@ -679,10 +782,23 @@ export class WorkflowEngine {
   private readonly options: WorkflowEngineOptions;
   private readonly stageRecords: WorkflowStageRecord[];
   private readonly homeDir: string | undefined;
+  /** Batch 2 #8: static triage decision computed before any dispatch (design §5). */
+  private readonly triageDecision: TriageDecision;
+  /** Effective run lane: the triage decision with the gated gateway ruling applied. */
+  private readonly lane: WorkflowLane;
+  /** Batch 2 #9: fast-lane sampled-review ratio (0 disables sampling). */
+  private readonly samplingRate: number;
+  /** Batch 2 #9: ordered mid-run lane events (audit trail for the ledger + compact flags). */
+  private readonly laneEvents: WorkflowLaneEvent[] = [];
   private dispatchSeq = 0;
   private overall: WorkflowOverallStatus = "running";
   private evidence?: WorkflowEvidence;
-  private failure?: { stageName: string; reason: string; finalError?: string };
+  private failure?: {
+    stageName: string;
+    reason: string;
+    finalError?: string;
+    errorCode?: string;
+  };
   private startedAt = new Date().toISOString();
   private updatedAt = this.startedAt;
   private runPromise?: Promise<WorkflowSnapshot>;
@@ -695,6 +811,11 @@ export class WorkflowEngine {
     this.spec = spec;
     this.options = options;
     this.id = `wf_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+    // Batch 2 #8: triage runs at construction — the lane must be known before
+    // the first dispatch and stamped on every snapshot from the start.
+    this.triageDecision = triageWorkflow({ spec, requirements: options.requirements });
+    this.lane = resolveRunLane(this.triageDecision, spec.gateRuling);
+    this.samplingRate = options.samplingRate ?? DEFAULT_SAMPLING_RATE;
     const resumeByName =
       options.resumeSnapshot && options.resumeSnapshot.name === spec.name
         ? new Map(options.resumeSnapshot.stages.map((stage) => [stage.name, stage]))
@@ -780,6 +901,8 @@ export class WorkflowEngine {
       workflowId: this.id,
       name: this.spec.name,
       status: this.overall,
+      lane: this.lane,
+      ...(this.laneEvents.length > 0 ? { laneEvents: [...this.laneEvents] } : {}),
       stages: this.stageRecords.map((stage) => ({
         ...stage,
         tasks: stage.tasks.map((task) => ({ ...task })),
@@ -813,15 +936,31 @@ export class WorkflowEngine {
 
   private async execute(): Promise<WorkflowSnapshot> {
     try {
-      for (const [index, stageSpec] of this.spec.stages.entries()) {
-        const record = this.stageRecords[index]!;
-        // P-079 resume: stages inherited as `passed` from the resumed snapshot
-        // are skipped — no dispatch, no acceptance re-run, sessions preserved.
-        if (record.status === "passed") continue;
-        const outcome = await this.runStage(stageSpec, record);
-        if (outcome !== "passed") break;
+      // Batch 2 #8 gated gateway (design §5, contract-frozen): a triage
+      // decision of `gated` without a spec.gateRuling fails closed BEFORE any
+      // dispatch — the evidence chain carries the triage reasons.
+      if (this.triageDecision.lane === "gated" && this.spec.gateRuling === undefined) {
+        const triageReasons = this.triageDecision.reasons.join("; ");
+        this.overall = "failed";
+        this.failure = {
+          stageName: this.spec.stages[0]?.name ?? "(unknown)",
+          reason:
+            "GATE_RULING_REQUIRED: the triage engine assigned the gated lane and spec.gateRuling " +
+            "is absent; the run failed closed before any dispatch. " +
+            `Triage reasons: ${triageReasons}`,
+          errorCode: "GATE_RULING_REQUIRED",
+        };
+      } else {
+        for (const [index, stageSpec] of this.spec.stages.entries()) {
+          const record = this.stageRecords[index]!;
+          // P-079 resume: stages inherited as `passed` from the resumed snapshot
+          // are skipped — no dispatch, no acceptance re-run, sessions preserved.
+          if (record.status === "passed") continue;
+          const outcome = await this.runStage(stageSpec, record);
+          if (outcome !== "passed") break;
+        }
+        if (this.overall === "running") this.overall = "done";
       }
-      if (this.overall === "running") this.overall = "done";
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.overall = "failed";
@@ -1000,6 +1139,9 @@ export class WorkflowEngine {
       pid: process.pid,
       startedAtMs: Date.now(),
       outputFile,
+      // Batch 2 #8: the triage lane rides the registry record so the watchdog
+      // stall metrics line (background.ts) can attribute the lane.
+      ...(this.lane ? { lane: this.lane } : {}),
     });
     this.options.background.launch({
       taskId,
@@ -1048,6 +1190,7 @@ export class WorkflowEngine {
           contextSessionIds: request.contextSessionIds,
           // The workflow owns the rework loop; every review dispatch is single-pass.
           maxReworkRounds: 0,
+          lane: request.lane,
           signal,
         });
       case "continue":
@@ -1056,6 +1199,7 @@ export class WorkflowEngine {
           task: request.task,
           mode: request.mode,
           timeoutMs: request.timeoutMs,
+          lane: request.lane,
           signal,
         });
       case "delegate":
@@ -1067,6 +1211,7 @@ export class WorkflowEngine {
           mode: request.mode,
           timeoutMs: request.timeoutMs,
           contextSessionIds: request.contextSessionIds,
+          lane: request.lane,
           signal,
           // Same stamp the background delegate path uses: tees vendor output to
           // the task capture file, feeds the stalled watchdog, registers the
@@ -1128,6 +1273,15 @@ export class WorkflowEngine {
     this.transitionStage(record, "dispatched");
     this.transitionStage(record, "running");
 
+    // Batch 2 #9 tree guard (fast lane): pre-dispatch working-tree snapshot so
+    // the guard can attribute exactly what the worker wrote. Only taken when
+    // the stage declares files — the declared set IS the in-scope reference.
+    const fastLaneGuard =
+      this.lane === "fast" && role !== "reviewer" && (stageSpec.acceptance?.files?.length ?? 0) > 0;
+    const repositoryBefore = fastLaneGuard
+      ? await captureRepositoryState(this.options.cwd ?? process.cwd())
+      : undefined;
+
     const groups = stageSpec.parallelGroups ?? [undefined];
     // parallelGroups dispatches run concurrently (mutually-exclusive packages);
     // a rejected dispatch degrades to a failed AgentResult so the stage-failure
@@ -1146,6 +1300,7 @@ export class WorkflowEngine {
           kind: role === "reviewer" ? "review" : "delegate",
           role,
           task,
+          lane: this.lane,
           ...(stageSpec.dispatch.agent ? { agent: stageSpec.dispatch.agent } : {}),
           ...(stageSpec.dispatch.mode ? { mode: stageSpec.dispatch.mode } : {}),
           ...(contextSessionIds ? { contextSessionIds } : {}),
@@ -1185,6 +1340,12 @@ export class WorkflowEngine {
       });
     }
 
+    // Batch 2 #9: post-worker snapshot, taken BEFORE acceptance so command
+    // side effects (build artifacts etc.) are not attributed to the worker.
+    const repositoryAfterWorker = fastLaneGuard
+      ? await captureRepositoryState(this.options.cwd ?? process.cwd())
+      : undefined;
+
     if (stageSpec.acceptance) {
       this.transitionStage(record, "acceptance");
       const acceptance = await this.runAcceptance(stageSpec);
@@ -1203,6 +1364,37 @@ export class WorkflowEngine {
           failureClass: "acceptance",
         });
       }
+    }
+
+    // Batch 2 #9 (design §5, fast lane only): tree guard first — an
+    // out-of-scope write upgrades the stage in place to a reviewed run
+    // (reviewer + rework loop, zero leader involvement, no rollback); then the
+    // seeded sampler may force a post-acceptance audit review. Both fire only
+    // for execution stages; reviewer stages own their verdict contract.
+    if (fastLaneGuard) {
+      const guardOutcome = await this.runTreeGuard({
+        stageSpec,
+        record,
+        policy,
+        repositoryBefore,
+        repositoryAfter: repositoryAfterWorker,
+        contextSessionIds,
+      });
+      if (guardOutcome !== "passed") return guardOutcome;
+    }
+    if (
+      this.lane === "fast" &&
+      role !== "reviewer" &&
+      this.samplingRate > 0 &&
+      shouldSampleStage({ seed: this.id, stage: stageSpec.name, rate: this.samplingRate })
+    ) {
+      const sampledOutcome = await this.runSampledReview({
+        stageSpec,
+        record,
+        policy,
+        contextSessionIds,
+      });
+      if (sampledOutcome !== "passed") return sampledOutcome;
     }
 
     if (role === "reviewer") {
@@ -1250,7 +1442,9 @@ export class WorkflowEngine {
     if (review.verdict !== "FAIL") return "unresolved";
 
     let current = initialReview;
-    const workerSessionId = this.workerSessionIdForRework();
+    // Inline upgrades (tree guard) review the SAME stage that produced the
+    // worker session; reviewer stages find it on a preceding record.
+    const workerSessionId = record.workerSessionId ?? this.workerSessionIdForRework();
     const maxRounds = Math.min(Math.max(policy.maxReworkRounds, 0), 3);
     for (let round = 1; round <= maxRounds; round += 1) {
       this.transitionStage(record, "rework");
@@ -1311,6 +1505,161 @@ export class WorkflowEngine {
     // Loop exit is only reachable with verdict still FAIL: PASS and UNKNOWN
     // return inside the loop, and every break keeps the entering FAIL verdict.
     return "roundsExhausted";
+  }
+
+  private recordLaneEvent(stage: string, event: WorkflowLaneEvent["event"], detail: string): void {
+    this.laneEvents.push({ at: new Date().toISOString(), stage, event, detail });
+  }
+
+  /**
+   * Batch 2 #9 tree guard (design §5, fast lane): diffs the pre/post-dispatch
+   * working-tree fingerprints and compares every path the worker changed
+   * against the stage's declared acceptance.files. Out-of-scope writes are NOT
+   * rolled back and NOT re-dispatched — the stage is upgraded in place to a
+   * reviewed run (initial review + bounded rework loop), the upgrade event is
+   * recorded for the ledger anomalies, and zero leader tokens are spent.
+   * Degradations (no git work tree, fingerprint cap exceeded) are recorded
+   * honestly as checked:false instead of failing the stage.
+   */
+  private async runTreeGuard(params: {
+    stageSpec: WorkflowStageSpec;
+    record: WorkflowStageRecord;
+    policy: ResolvedStagePolicy;
+    repositoryBefore: RepositoryStateEvidence | undefined;
+    repositoryAfter: RepositoryStateEvidence | undefined;
+    contextSessionIds: string[] | undefined;
+  }): Promise<"passed" | "escalated" | "failed"> {
+    const { stageSpec, record, policy, repositoryBefore, repositoryAfter } = params;
+
+    if (!repositoryBefore || !repositoryAfter) {
+      record.treeGuard = {
+        checked: false,
+        outOfScopePaths: [],
+        note: "repository capture unavailable (cwd is not a git work tree); out-of-scope write check skipped",
+      };
+      this.persistAndNotify();
+      return "passed";
+    }
+    if (!repositoryBefore.pathFingerprints || !repositoryAfter.pathFingerprints) {
+      record.treeGuard = {
+        checked: false,
+        outOfScopePaths: [],
+        note: "per-path fingerprints unavailable (change set exceeded the fingerprint cap); out-of-scope write check skipped",
+      };
+      this.persistAndNotify();
+      return "passed";
+    }
+
+    const root = repositoryAfter.repositoryRoot;
+    const cwd = this.options.cwd ?? process.cwd();
+    // Declared files are cwd-relative; repository evidence is repo-root
+    // relative. Normalize both into repo-root-relative slash paths so a
+    // workflow running in a repo subdirectory still matches.
+    const scopes = (stageSpec.acceptance?.files ?? [])
+      .map((file) => toRepoRelativeScope(root, cwd, file))
+      .filter((scope): scope is string => scope !== undefined);
+
+    const before = repositoryBefore.pathFingerprints;
+    const after = repositoryAfter.pathFingerprints;
+    const outOfScope = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+      .filter((changed) => before[changed] !== after[changed])
+      .filter((changed) => !isPathWithinScope(changed, scopes))
+      .sort();
+
+    if (outOfScope.length === 0) {
+      record.treeGuard = { checked: true, outOfScopePaths: [] };
+      this.persistAndNotify();
+      return "passed";
+    }
+
+    record.treeGuard = { checked: true, outOfScopePaths: outOfScope, upgraded: true };
+    this.recordLaneEvent(
+      record.name,
+      "tree-guard-upgrade",
+      `worker wrote ${outOfScope.length} path(s) outside the declared file set: ${outOfScope.join(", ")}`,
+    );
+    this.persistAndNotify();
+
+    // In-place upgrade to a reviewed run: same machinery as a reviewer stage
+    // (initial review → bounded rework loop), staged off the tree-guard prompt.
+    this.transitionStage(record, "review");
+    const initialReview = await this.runDispatchTask(record, {
+      kind: "review",
+      role: "reviewer",
+      task: buildTreeGuardReviewPrompt(record.name, outOfScope),
+      // Real dispatch paths resolve the agent from the stage declaration (the
+      // fast lane has no dedicated reviewer stage to inherit one from).
+      ...(stageSpec.dispatch.agent ? { agent: stageSpec.dispatch.agent } : {}),
+      ...(stageSpec.dispatch.mode ? { mode: stageSpec.dispatch.mode } : {}),
+      ...(stageSpec.dispatch.timeoutMs !== undefined
+        ? { timeoutMs: stageSpec.dispatch.timeoutMs }
+        : {}),
+      ...(params.contextSessionIds ? { contextSessionIds: params.contextSessionIds } : {}),
+    });
+    const outcome = await this.runReviewStage(
+      stageSpec,
+      record,
+      policy,
+      initialReview,
+      params.contextSessionIds,
+    );
+    if (outcome === "passed") return "passed";
+    return this.terminateStage(record, policy, {
+      reason:
+        outcome === "roundsExhausted"
+          ? `Tree-guard upgrade review still FAIL after ${policy.maxReworkRounds} rework round(s).`
+          : "Tree-guard upgrade review did not return a PASS verdict.",
+      finalError: initialReview.error ?? initialReview.summary,
+      failureClass: "review",
+    });
+  }
+
+  /**
+   * Batch 2 #9 sampled post-acceptance review (design §5): a seeded random
+   * 10-20% of fast-lane stages get a forced reviewer audit even though the
+   * lane skipped the review stage. A non-PASS verdict fails the stage
+   * (fail-closed) — sampled defects are the human triage-tuning feedback
+   * channel (#14), never silently absorbed.
+   */
+  private async runSampledReview(params: {
+    stageSpec: WorkflowStageSpec;
+    record: WorkflowStageRecord;
+    policy: ResolvedStagePolicy;
+    contextSessionIds: string[] | undefined;
+  }): Promise<"passed" | "escalated" | "failed"> {
+    const { stageSpec, record } = params;
+    this.recordLaneEvent(
+      record.name,
+      "sampled-review",
+      `seeded sampler (rate ${this.samplingRate}) selected this stage for a mandatory post-acceptance review`,
+    );
+    this.transitionStage(record, "review");
+    const review = await this.runDispatchTask(record, {
+      kind: "review",
+      role: "reviewer",
+      task:
+        `Sampled post-acceptance review (fast-lane audit) of stage '${record.name}': this stage ` +
+        "passed its acceptance commands without a review stage; the seeded sampler selected it for " +
+        "a mandatory audit. Run the full read-only review against the current working tree and end " +
+        "with your verdict.",
+      // Real dispatch paths resolve the agent from the stage declaration (the
+      // fast lane has no dedicated reviewer stage to inherit one from).
+      ...(stageSpec.dispatch.agent ? { agent: stageSpec.dispatch.agent } : {}),
+      ...(stageSpec.dispatch.mode ? { mode: stageSpec.dispatch.mode } : {}),
+      ...(stageSpec.dispatch.timeoutMs !== undefined
+        ? { timeoutMs: stageSpec.dispatch.timeoutMs }
+        : {}),
+      ...(params.contextSessionIds ? { contextSessionIds: params.contextSessionIds } : {}),
+    });
+    const verdict = review.reviewOutcome ?? "UNKNOWN";
+    record.sampleReview = { verdict, findings: review.findings ?? [] };
+    this.persistAndNotify();
+    if (verdict === "PASS") return "passed";
+    return this.terminateStage(record, params.policy, {
+      reason: `Sampled post-acceptance review returned ${verdict} (fail-closed); findings feed the manual triage-rules reflow.`,
+      finalError: review.error ?? review.summary,
+      failureClass: "review",
+    });
   }
 
   /** Runs acceptance commands + file checks sequentially in the target cwd. */

@@ -1290,6 +1290,61 @@ describe("core/runner", () => {
     expect(context).not.toContain("FULL_TEXT_SENTINEL");
   });
 
+  it("auto-compacts a session whose estimated tokens cross the Tier 2 threshold (#13)", async () => {
+    process.env.AGENTMESH_AUTOCOMPACT_PCT = "100";
+    // A 10-token window makes any real turn cross the 100% threshold.
+    process.env.AGENTMESH_CONTEXT_WINDOW_TOKENS = "10";
+    try {
+      const summarizer = new SummarizerAdapter();
+      registry.register(summarizer);
+      const source = await runner.delegateTask({ agent: "codex", task: "Build the feature" });
+
+      expect(source.status).toBe("success");
+      expect(source.warning).toContain("Tier 2 autocompact");
+      expect(source.warning).toContain("status 'summarized'");
+      // The compaction actually condensed the session: a summary sidecar exists.
+      const stored = sessionManager.getSummary(source.sessionId!);
+      expect(stored?.text).toContain("mocked intent");
+    } finally {
+      delete process.env.AGENTMESH_AUTOCOMPACT_PCT;
+      delete process.env.AGENTMESH_CONTEXT_WINDOW_TOKENS;
+    }
+  });
+
+  it("reports a failed autocompact as advisory without failing the turn (#13)", async () => {
+    process.env.AGENTMESH_AUTOCOMPACT_PCT = "100";
+    process.env.AGENTMESH_CONTEXT_WINDOW_TOKENS = "10";
+    try {
+      const source = await runner.delegateTask({ agent: "codex", task: "Seed work" });
+      sessionManager.addHistory(source.sessionId!, {
+        role: "worker",
+        // The adapter throws on TRIGGER_ERROR; the compaction prompt embeds the
+        // normalized history, so the summarization turn fails while the
+        // triggering turn itself must stay successful.
+        task: `TRIGGER_ERROR ${"x".repeat(400)}`,
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "huge unmetered turn",
+      });
+      const cont = await runner.continueTask({ sessionId: source.sessionId!, task: "Continue" });
+
+      expect(cont.status).toBe("success");
+      expect(cont.warning).toContain("Tier 2 autocompact");
+      expect(cont.warning).toContain("status 'failed'");
+    } finally {
+      delete process.env.AGENTMESH_AUTOCOMPACT_PCT;
+      delete process.env.AGENTMESH_CONTEXT_WINDOW_TOKENS;
+    }
+  });
+
+  it("does not auto-compact below the default Tier 2 threshold (#13)", async () => {
+    const summarizer = new SummarizerAdapter();
+    registry.register(summarizer);
+    const source = await runner.delegateTask({ agent: "codex", task: "Small turn" });
+    expect(source.warning ?? "").not.toContain("Tier 2 autocompact");
+    expect(sessionManager.getSummary(source.sessionId!)).toBeUndefined();
+  });
+
   it("falls back to full transcript injection when the source gains turns after compaction (T2.3 STALE)", async () => {
     const summarizer = new SummarizerAdapter();
     registry.register(summarizer);

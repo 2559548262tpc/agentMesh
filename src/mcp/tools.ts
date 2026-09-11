@@ -1,5 +1,5 @@
 import * as crypto from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -41,7 +41,15 @@ import {
   verifyRequirementQuotes,
 } from "../core/requirements.js";
 import type { RequirementsFile } from "../core/requirements.js";
+import {
+  runDistillRequirements,
+  runSummarizeForLeader,
+  SUMMARY_MAX_CHARS_CEILING,
+  SUMMARY_MIN_CHARS,
+  type AdjutantDispatch,
+} from "../core/adjutant.js";
 import { findUnknownRequirementIds } from "../core/ledger.js";
+import { clampSamplingRate } from "../core/triage.js";
 import type { PollTaskOutcome } from "../core/background.js";
 import type { WorkflowSnapshot } from "../core/workflow.js";
 import {
@@ -1151,6 +1159,16 @@ export const RunWorkflowInputSchema = z.object({
         "rounds, Bridge sessions) and skipped — after a needs_ruling ruling, re-run with the same " +
         "spec to re-close the ledger without re-dispatching already-passed stages",
     ),
+  samplingRate: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      "v0.5 Batch 2 #9: fast-lane seeded sampling ratio for mandatory post-acceptance reviews. " +
+        "0 disables sampling; any non-zero value is clamped into the design band 0.1-0.2 " +
+        "(default 0.15). Only affects stages triaged into the fast lane",
+    ),
 });
 
 export const GetWorkflowInputSchema = z.object({
@@ -1386,6 +1404,71 @@ export const VerifyContractMapInputSchema = z.object({
   cwd: NonBlankString.optional().describe(
     "Working directory used to resolve relative file paths (defaults to current directory)",
   ),
+});
+
+export const DistillRequirementsInputSchema = z.object({
+  sourcePath: NonBlankString.describe(
+    "Path to the requirement document to distill (absolute or relative to cwd)",
+  ),
+  outputPath: NonBlankString.optional().describe(
+    "Where to write the distilled requirements.json (default: requirements.json under cwd)",
+  ),
+  cwd: NonBlankString.optional().describe(
+    "Working directory used to resolve relative paths and locate .agentmesh/config.json (defaults to current directory)",
+  ),
+  agent: NonBlankString.optional().describe(
+    "Adjutant agent override (free tier per design §7, e.g. opencode). Default: the worker role assignment",
+  ),
+  model: NonBlankString.optional().describe(
+    "Adjutant model override passed through to the agent adapter (e.g. a free-pool model id)",
+  ),
+  timeoutMs: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(MAX_TIMEOUT_MS)
+    .optional()
+    .describe("Per-dispatch timeout in ms (probe and each distillation attempt)"),
+});
+
+export const SummarizeForLeaderInputSchema = z.object({
+  text: z
+    .string()
+    .min(1)
+    .max(200_000)
+    .optional()
+    .describe("Inline content to digest (exactly one of text/path)"),
+  path: NonBlankString.optional().describe(
+    "File whose content should be digested (absolute or relative to cwd; exactly one of text/path)",
+  ),
+  focus: NonBlankString.optional().describe(
+    "What the leader specifically needs from this digest (question the summary must answer)",
+  ),
+  maxChars: z
+    .number()
+    .int()
+    .min(SUMMARY_MIN_CHARS)
+    .max(SUMMARY_MAX_CHARS_CEILING)
+    .optional()
+    .describe(
+      "Hard ceiling for the digest in characters (default 2000; larger outputs are truncated with a flag)",
+    ),
+  cwd: NonBlankString.optional().describe(
+    "Working directory used to resolve relative paths and locate .agentmesh/config.json (defaults to current directory)",
+  ),
+  agent: NonBlankString.optional().describe(
+    "Adjutant agent override (free tier per design §7, e.g. opencode). Default: the worker role assignment",
+  ),
+  model: NonBlankString.optional().describe(
+    "Adjutant model override passed through to the agent adapter (e.g. a free-pool model id)",
+  ),
+  timeoutMs: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(MAX_TIMEOUT_MS)
+    .optional()
+    .describe("Per-dispatch timeout in ms (probe and the digest attempt)"),
 });
 
 /** Formats one routing-metadata field group, degrading to "unmetered" (T4.2). */
@@ -1971,6 +2054,11 @@ export function registerMcpTools(
           cwd,
           candidateResolver: createDefaultCandidateResolver(runner, cwd),
           ...(requirements ? { requirements } : {}),
+          // Batch 2 #9: MCP-surface sampling override, clamped into the design
+          // band (0 = explicit disable) before reaching the engine.
+          ...(args.samplingRate !== undefined
+            ? { samplingRate: clampSamplingRate(args.samplingRate) }
+            : {}),
           // Batch 3 #12 (P-080⑤): push the terminal status to the host via
           // the logging-notification channel instead of polling only.
           eventBus: background.registry.eventBus,
@@ -2393,6 +2481,148 @@ export function registerMcpTools(
         const errorMsg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Bridge Error in compact_context: ${errorMsg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // distill_requirements — v0.5 Batch 2 #7 adjutant (design §3 ①, §7)
+  server.tool(
+    "distill_requirements",
+    [
+      "Distills a requirement document into a requirements.json (EARS items + verbatim source quotes + decidable flags) via the free-tier adjutant channel, so the leader never structures requirements by hand unless the channel fails.",
+      "Safety pipeline (design §7): probe-first (a failed probe fails closed immediately) → distill dispatch → output is Zod-validated (schema-invalid output is retried ONCE with the issues attached) → mechanical zero-token quote gate (every quote must be a verbatim substring of the source document; fabrication is terminal, never retried) → count cross-check (warning only).",
+      "Fail-closed semantics: probe/transport failures or a fabricated quote return isError with the issues and the leader hand-writes requirements.json instead — there is never a second real dispatch beyond the design's single schema retry. The written file is exactly what the run_workflow requirementsPath gate consumes.",
+    ].join("\n"),
+    DistillRequirementsInputSchema.shape,
+    async (args: z.infer<typeof DistillRequirementsInputSchema>) => {
+      try {
+        const cwd = args.cwd ?? process.cwd();
+        const sourcePath = path.isAbsolute(args.sourcePath)
+          ? args.sourcePath
+          : path.resolve(cwd, args.sourcePath);
+        const document = readFileSync(sourcePath, "utf-8");
+        const outputPath = args.outputPath
+          ? path.isAbsolute(args.outputPath)
+            ? args.outputPath
+            : path.resolve(cwd, args.outputPath)
+          : path.join(cwd, "requirements.json");
+        const dispatch: AdjutantDispatch = (p) =>
+          runner.delegateTask({
+            ...(args.agent ? { agent: args.agent } : { role: "worker" as const }),
+            ...(args.model ? { model: args.model } : {}),
+            ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
+            cwd,
+            task: p.task,
+          });
+        const outcome = await runDistillRequirements(dispatch, {
+          document,
+          sourceName: args.sourcePath,
+        });
+        if (outcome.status !== "distilled") {
+          const guidance =
+            outcome.status === "probe-failed"
+              ? "The adjutant channel is unavailable (probe failed). Hand-write requirements.json per design §7 fail-closed — no retry is attempted."
+              : outcome.status === "dispatch-failed"
+                ? "The adjutant dispatch failed. Hand-write requirements.json per design §7 fail-closed — no retry is attempted."
+                : `Distillation failed closed (stage: ${outcome.stage}). Hand-write requirements.json per design §7 — quote fabrication is never retried; schema issues may be fixed by hand or by re-dispatching.`;
+          const detail =
+            outcome.status === "fail-closed"
+              ? outcome.issues.map((issue) => `- ${issue}`).join("\n")
+              : outcome.error;
+          return {
+            content: [{ type: "text", text: `${guidance}\n\n${detail}` }],
+            isError: true,
+          };
+        }
+        writeFileSync(outputPath, `${JSON.stringify(outcome.requirements, null, 2)}\n`, "utf-8");
+        const decidable = outcome.requirements.items.filter((item) => item.decidable).length;
+        const lines = [
+          `Status: distilled | Output: ${outputPath}`,
+          `Source: ${outcome.requirements.source} | Items: ${outcome.requirements.items.length} (decidable ${decidable}, ruling ${outcome.requirements.items.length - decidable})`,
+          `Quote gate: ${outcome.quoteReport.pass ? "pass" : "FAIL"} | Count check: ${outcome.countCheck.itemCount} items vs ${outcome.countCheck.sectionCount} sections + ${outcome.countCheck.listItemCount} list entries${outcome.countCheck.plausible ? "" : " — implausible, review the distillation"}`,
+          `Schema retries used: ${outcome.schemaRetriesUsed}`,
+          ...(outcome.countCheck.plausible
+            ? []
+            : [
+                "Warning: item count exceeds the source structure — verify no requirements were invented.",
+              ]),
+        ];
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Bridge Error in distill_requirements: ${errorMsg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // summarize_for_leader — v0.5 Batch 2 #7 adjutant (P-080③ leader-digest)
+  server.tool(
+    "summarize_for_leader",
+    [
+      "Digests a large output (inline text or a file) into a leader-consumption summary via the free-tier adjutant channel (P-080③), so the leader never reads raw long content into his own context.",
+      "Digest contract: verdict-first first line, then only decision-relevant facts (root causes, numbers, paths, exit codes, open questions), hard character ceiling (default 2000; deterministic truncation with a truncated flag, Tier 0 style).",
+      "Fail-closed semantics: probe failure, dispatch failure, or an empty digest return isError — the fallback is the leader reading the raw content himself, never a retry loop and never a fabricated summary.",
+    ].join("\n"),
+    SummarizeForLeaderInputSchema.shape,
+    async (args: z.infer<typeof SummarizeForLeaderInputSchema>) => {
+      try {
+        if (Boolean(args.text) === Boolean(args.path)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Bridge Error in summarize_for_leader: provide exactly one of 'text' or 'path'.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        const cwd = args.cwd ?? process.cwd();
+        const content = args.text
+          ? args.text
+          : readFileSync(
+              path.isAbsolute(args.path!) ? args.path! : path.resolve(cwd, args.path!),
+              "utf-8",
+            );
+        const dispatch: AdjutantDispatch = (p) =>
+          runner.delegateTask({
+            ...(args.agent ? { agent: args.agent } : { role: "worker" as const }),
+            ...(args.model ? { model: args.model } : {}),
+            ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
+            cwd,
+            task: p.task,
+          });
+        const outcome = await runSummarizeForLeader(dispatch, {
+          content,
+          ...(args.focus ? { focus: args.focus } : {}),
+          ...(args.maxChars !== undefined ? { maxChars: args.maxChars } : {}),
+        });
+        if (outcome.status !== "summarized") {
+          const guidance =
+            outcome.status === "probe-failed"
+              ? "The adjutant channel is unavailable (probe failed). Fall back to reading the raw content yourself."
+              : outcome.status === "dispatch-failed"
+                ? "The adjutant dispatch failed. Fall back to reading the raw content yourself."
+                : "The adjutant returned an empty digest. Fall back to reading the raw content yourself.";
+          const detail = outcome.error;
+          return {
+            content: [{ type: "text", text: `${guidance}\n${detail}` }],
+            isError: true,
+          };
+        }
+        const meta = `Digest: ${outcome.inputChars} chars in → ${outcome.summary.length} chars out${outcome.truncated ? " | TRUNCATED to the ceiling" : ""}`;
+        return {
+          content: [{ type: "text", text: `${outcome.summary}\n\n${meta}` }],
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Bridge Error in summarize_for_leader: ${errorMsg}` }],
           isError: true,
         };
       }

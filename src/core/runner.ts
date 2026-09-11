@@ -22,7 +22,7 @@ import {
 import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import { appendTaskMetrics } from "./metrics.js";
-import type { TaskMetricsOutcome } from "./metrics.js";
+import type { TaskMetricsOutcome, WorkflowLane } from "./metrics.js";
 import { readTaskQueuedDurationMs } from "./background.js";
 import {
   ModelHealthStore,
@@ -49,6 +49,7 @@ import { buildSummaryPrompt, stripAnalysisDraft, buildReworkFixPrompt } from "./
 import { truncateText } from "./text.js";
 import { archiveSessionHistory } from "./archive.js";
 import type { ArchiveSessionReport } from "./archive.js";
+import { evaluateSessionAutoCompact, resolveAutoCompactConfig } from "./autocompact.js";
 import { evaluateBudgetGate } from "./budget.js";
 import { type CheckpointStore, defaultCheckpointStore } from "./checkpoint.js";
 import type {
@@ -130,6 +131,12 @@ export interface DelegateTaskParams {
    * TTL replay the recorded result instead of re-executing (P1 T1.1).
    */
   idempotencyKey?: string;
+  /**
+   * v0.5 Batch 2 #8 triage lane (design §5) the workflow engine stamps onto
+   * every stage dispatch; rides into the per-dispatch metrics record for the
+   * by-lane aggregation. Absent for direct MCP dispatches (no triage context).
+   */
+  lane?: WorkflowLane;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
   /**
@@ -138,6 +145,13 @@ export interface DelegateTaskParams {
    * the background delegate path (mcp/tools.ts).
    */
   taskActivity?: { taskId: string; outputFile: string };
+  /**
+   * Internal: suppresses the Tier 2 autocompact evaluation for this dispatch.
+   * Only the runner's own compaction dispatch sets it, so a compaction turn can
+   * never recursively trigger another compaction. Deliberately absent from the
+   * MCP input schemas (same pattern as reviewVerdictRequired).
+   */
+  autoCompactDisabled?: boolean;
 }
 
 export interface ReviewChangesParams {
@@ -160,6 +174,8 @@ export interface ReviewChangesParams {
   contextSessionId?: string;
   /** Source sessions (max 4) whose normalized history is injected first-hand, in the given order. */
   contextSessionIds?: string[];
+  /** v0.5 Batch 2 #8 triage lane stamped by the workflow engine (see DelegateTaskParams.lane). */
+  lane?: WorkflowLane;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
   /**
@@ -184,6 +200,8 @@ export interface ContinueTaskParams {
   extraArgs?: string[];
   /** Source sessions (max 4) injected alongside the session's own native resume. */
   contextSessionIds?: string[];
+  /** v0.5 Batch 2 #8 triage lane stamped by the workflow engine (see DelegateTaskParams.lane). */
+  lane?: WorkflowLane;
   /**
    * P5 T5.2 one-shot recovery baton: consumes the named checkpoint (saved by
    * the stalled watchdog, orphan sweep, or a failed background dispatch) and
@@ -1489,6 +1507,7 @@ export class MultiAgentRunner {
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
         effectiveModel: effectiveRequestedModel,
         bgTaskId: params.taskActivity?.taskId,
+        lane: params.lane,
       });
 
       // Post-execution water-level check: this turn's usage is now in the
@@ -1500,6 +1519,18 @@ export class MultiAgentRunner {
         const postGate = this.evaluateBudgetForSession(configCwd, refreshedSession);
         if (postGate.action === "warn" || postGate.action === "reject") {
           result.warning = [result.warning, postGate.warning].filter(Boolean).join(" ");
+        }
+      }
+
+      // v0.5 Batch 3 #13 (design §6): Tier 2 LLM-compression fallback. When the
+      // session's estimated token footprint crosses the configured fraction of
+      // the context window, its own agent condenses the history (one LLM call).
+      // Advisory only: the outcome rides the warning channel and a compaction
+      // failure never fails the turn that triggered it.
+      if (refreshedSession && !params.autoCompactDisabled) {
+        const autoCompactNote = await this.maybeAutoCompactSession(session.id);
+        if (autoCompactNote) {
+          result.warning = [result.warning, autoCompactNote].filter(Boolean).join(" ");
         }
       }
 
@@ -1580,6 +1611,7 @@ export class MultiAgentRunner {
         env: params.env,
         contextSessionId: params.contextSessionId,
         contextSessionIds: params.contextSessionIds,
+        lane: params.lane,
         reviewVerdictRequired: true,
         signal: params.signal,
       });
@@ -1955,12 +1987,43 @@ export class MultiAgentRunner {
         sharedContextText: sharedContext?.text,
         sharedContextSources: sharedContext?.sources,
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
+        lane: params.lane,
       });
+
+      // v0.5 Batch 3 #13: Tier 2 autocompact on continued runs too (see
+      // delegateTask for the trigger semantics and advisory disclosure).
+      const autoCompactNote = await this.maybeAutoCompactSession(session.id);
+      if (autoCompactNote) {
+        result.warning = [result.warning, autoCompactNote].filter(Boolean).join(" ");
+      }
 
       return result;
     } finally {
       inFlight.finish();
     }
+  }
+
+  /**
+   * v0.5 Batch 3 #13 Tier 2 autocompact trigger (design §6). Evaluates the
+   * session's estimated token footprint against AGENTMESH_AUTOCOMPACT_PCT of
+   * the assumed window and, on crossing, runs compact_context on it with the
+   * session's own agent. Returns the advisory disclosure note (undefined when
+   * nothing ran); compaction failures are reported, never thrown.
+   */
+  private async maybeAutoCompactSession(sessionId: string): Promise<string | undefined> {
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session || session.history.length === 0) return undefined;
+    const config = resolveAutoCompactConfig();
+    const decision = evaluateSessionAutoCompact(session.history, config);
+    if (!decision.trigger) return undefined;
+    const { outcomes } = await this.compactContext({ sourceSessionIds: [sessionId] });
+    const outcome = outcomes[0];
+    const statusNote = outcome ? outcome.status : "unknown";
+    return (
+      `Tier 2 autocompact: estimated ${decision.estimateTokens} tokens reached the ` +
+      `${decision.thresholdTokens}-token threshold (${decision.pct}% of the assumed ` +
+      `${decision.windowTokens}-token window); compact_context ran with status '${statusNote}'.`
+    );
   }
 
   /**
@@ -2038,6 +2101,9 @@ export class MultiAgentRunner {
       cwd: session.cwd,
       role: "worker",
       task: prompt,
+      // Internal recursion guard: a compaction turn must never trigger the
+      // Tier 2 autocompact evaluation for its scratch session (#13).
+      autoCompactDisabled: true,
     });
     // The summarization turn runs on a throwaway bridge session bound to the
     // same agent/cwd. Delete it so compaction leaves exactly one durable
@@ -2365,6 +2431,8 @@ export class MultiAgentRunner {
     effectiveModel?: string;
     /** Background task id when this turn belongs to a background dispatch. */
     bgTaskId?: string;
+    /** v0.5 Batch 2 #8 triage lane for the metrics record (absent → "unknown" lane group). */
+    lane?: WorkflowLane;
   }): void {
     const { session, result, repositoryBefore, repositoryAfter } = options;
     const cancelReason =
@@ -2467,6 +2535,8 @@ export class MultiAgentRunner {
           role: options.role,
           agent: session.agent,
           model: options.effectiveModel ?? options.requestedModel,
+          // Batch 2 #8: the workflow engine's triage lane, "unknown" group when absent.
+          ...(options.lane ? { lane: options.lane } : {}),
           tokensIn: result.usage?.inputTokens ?? 0,
           tokensOut: result.usage?.outputTokens ?? 0,
           durationMs,

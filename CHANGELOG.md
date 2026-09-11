@@ -15,6 +15,24 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - **leaderShare 度量先行（Batch 1 #0，P-080④）：** `TaskMetrics` 增 `lane` 维度（fast/standard/gated/full，Batch 2 分诊填充），`agentmesh stats` 按 lane 聚合并支持 `--leader-tokens <n>`（宿主侧组长消耗，引擎不 meter 宿主、绝不伪造）计算 leaderShare，超 25% 阈值输出 `LEADER_SHARE_EXCEEDED` 告警。
 - **contract map 按 R 申报（Batch 1 #3）：** `verify_contract_map` 增 `requirementIds`：R id 成为必映射项（缺失 = missing，未声明条目 = unknown-item），契约清单可直接引用需求 id。
 
+### v0.5 Batch 2 — 分诊引擎与快车道（v0.5*设计*需求对账单架构.md #7-#9）
+
+#### Added
+
+- **副官工具（Batch 2 #7，P-080③）：** 新增 MCP 工具 `distill_requirements`（把需求文档经免费档副官通道蒸馏成 requirements.json：EARS 条目 + `quote` 原文引用 + `decidable` 标记）与 `summarize_for_leader`（把大段产出——内联文本或文件——消化成组长摘要：第一行结论 + 决策相关事实，硬字符上限默认 2000，超限确定性截断并附 truncated 标记）。两者均带探针预检（副官通道不可用即 fail-closed 返回结构化 error，组长回退手写/人工流程）；`distill_requirements` 允许单次 schema 修复重试，除该重试外绝无第二次真实派发，写盘文件即 `run_workflow` requirementsPath 闸门消费的原件。
+- **分诊引擎（Batch 2 #8）：** `run_workflow` 在派发前对 spec 做**静态确定性分诊**（零 token），lane（fast/standard/gated/full）写入每次派发的 metrics 记录与终态快照。`fast`——每 stage 文件集 ≤2、需求集存在且每项被验收命令 `covers` 覆盖、无跨 stage contextPolicy → 验收即评审；`standard`——文件集 3-5 无风险标记 → worker+reviewer+rework；`gated`——文件集 3-5 且任务文本命中风险关键词表（auth/permission/secret/token/credential/并发/锁/迁移/删除等）→ 闸道 fail-closed（`GATE_RULING_REQUIRED`），spec 顶层 `gateRuling: "standard"|"full"` 裁决后按裁决值继续；`full`——其余全流程。
+- **快车道安全网（Batch 2 #9）：** 两道确定性机制兜底"验收即评审"的跳审风险——**树守卫（tree guard）**对照 `acceptance.files` 声明集做逐路径指纹比对（非 git 目录如实标注 checked:false 跳过），worker 越界写即**就地升道**为完整评审环（初始评审 + 有界 rework，零组长介入）；**种子抽样器**按 `SHA-256(workflowId:stage)` 确定性抽 10-20% 快车道 stage（默认 15%）强制补审，非 PASS 判 fail-closed（抽检缺陷走人工回流修订分诊判据 #14）。升道/抽检事件记录进快照 `laneEvents` 并汇入 ledger `anomalies`。`run_workflow` MCP 增 `samplingRate` 参数：0 = 显式禁用，非零值夹紧进 0.1-0.2 设计档。
+
+#### Fixed
+
+- **快车道审计派发缺 agent 声明：** sampled review 与 tree guard 升道初评的派发请求未携带 stage 声明的 `agent`——Fake 通道单测掩盖了该缺陷，真实 MCP 路径下角色解析 fail-closed（"role 'reviewer' is not configured"）。现两处均继承 `stage.dispatch.agent`，并加确定性回归断言（核心 fake 测试 + MCP 协议测试）。
+
+### v0.5 Batch 3 — Tier 2 自动压缩（v0.5*设计*需求对账单架构.md #13）
+
+#### Added
+
+- **Tier 2 LLM 压缩兜底（#13）：** AgentMesh 侧会话的估算 token 占用越过阈值时，runner 在该轮记录后自动对该会话执行 `compact_context`（用会话自己的 Agent 一次 LLM 调用压缩历史），披露信息走 result warning 通道，压缩失败降级为 advisory 不影响当轮结果。阈值 = `AGENTMESH_AUTOCOMPACT_PCT`（默认 70，0 = 禁用）× 假定上下文窗口 `AGENTMESH_CONTEXT_WINDOW_TOKENS`（默认 200k）；估算口径：metered 轮次用 vendor 上报 usage 求和，未计量轮次按 chars/4 启发式（诚实估算，不伪造计量）；并发压缩去重（in-flight 提示），压缩后源会话新增轮次即 STALE 回落全文注入；压缩派发自身带递归护栏（不再触发 Tier 2）。
+
 ### v0.4 改造方案（ROADMAP_v0.4.md，M0-M7）
 
 #### Added

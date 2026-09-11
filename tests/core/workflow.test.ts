@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,6 +17,7 @@ import { BackgroundDispatchService } from "../../src/mcp/tools.js";
 import { BackgroundTaskRegistry } from "../../src/core/background.js";
 import { CheckpointStore } from "../../src/core/checkpoint.js";
 import { createAgentMeshEventBus } from "../../src/core/events.js";
+import { readTaskMetrics } from "../../src/core/metrics.js";
 import type { AgentResult, AgentRole } from "../../src/agents/types.js";
 import type {
   ContinueTaskParams,
@@ -42,6 +44,8 @@ interface RecordedCall {
   sessionId?: string;
   group?: string;
   mode?: string;
+  /** v0.5 Batch 2 #8 triage lane stamped by the workflow engine. */
+  lane?: string;
 }
 
 class FakeDispatchService implements WorkflowDispatchService {
@@ -66,6 +70,7 @@ class FakeDispatchService implements WorkflowDispatchService {
       sessionId?: string;
       group?: string;
       mode?: string;
+      lane?: string;
     },
   ): Promise<AgentResult> {
     const call: RecordedCall = {
@@ -77,6 +82,7 @@ class FakeDispatchService implements WorkflowDispatchService {
       ...(params.sessionId ? { continueSessionId: params.sessionId } : {}),
       ...(params.group ? { group: params.group } : {}),
       ...(params.mode ? { mode: params.mode } : {}),
+      ...(params.lane ? { lane: params.lane } : {}),
     };
     const index = this.calls.length;
     this.calls.push(call);
@@ -157,6 +163,10 @@ describe("core/workflow (M4 deterministic orchestration state machine)", () => {
       dispatch,
       background,
       cwd: workDir,
+      // Deterministic tests: the default 0.15 sampled-review rate flips on the
+      // random workflowId, so tests that don't exercise the sampler pin it to
+      // 0 and the #9 sampler tests override it explicitly.
+      samplingRate: 0,
       ...options,
     });
   };
@@ -873,6 +883,302 @@ describe("core/workflow (M4 deterministic orchestration state machine)", () => {
       const [s1Session, s2Session] = snapshot.stages.map((stage) => stage.sessionIds[0]!);
       expect(archiveCalls[0]!.archive).toEqual([s1Session]);
       expect(archiveCalls[0]!.keep).toEqual([s2Session]);
+    });
+  });
+
+  // v0.5 Batch 2 #8: triage engine + gated gateway (design §5). The gated
+  // fail-closed gate must fire BEFORE any dispatch; the lane rides the
+  // dispatch options into the metrics records and the snapshot.
+  describe("v0.5 Batch 2 #8 triage lane + gated gateway", () => {
+    /** 3-file spec whose taskTemplate hits the risk table → triage lane "gated". */
+    const gatedSpec = (gateRuling?: "standard" | "full"): WorkflowSpec => ({
+      name: "gated-run",
+      stages: [
+        {
+          name: "implement",
+          roles: ["worker"],
+          dispatch: { agent: "codex", taskTemplate: "Rotate the session AUTH handling" },
+          acceptance: {
+            commands: [{ cmd: `node -e "process.exit(0)"`, covers: ["R1"] }],
+            files: ["a.txt", "b.txt", "c.txt"],
+          },
+        },
+      ],
+      ...(gateRuling !== undefined ? { gateRuling } : {}),
+    });
+
+    it("fails closed with GATE_RULING_REQUIRED before any dispatch when gated and unruled", async () => {
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const engine = makeEngine(gatedSpec(), dispatch);
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("failed");
+      expect(snapshot.failure?.errorCode).toBe("GATE_RULING_REQUIRED");
+      expect(snapshot.failure?.reason).toContain("GATE_RULING_REQUIRED");
+      // The evidence chain carries the triage decision reasons.
+      expect(snapshot.failure?.reason).toContain("auth");
+      expect(snapshot.failure?.reason).toContain("= 3");
+      // Fail-closed: no dispatch, no task record, stage still pending.
+      expect(dispatch.calls).toHaveLength(0);
+      expect(snapshot.stages[0]!.tasks).toHaveLength(0);
+      expect(snapshot.stages[0]!.status).toBe("pending");
+    });
+
+    it("runs a gated spec with gateRuling and stamps the ruling lane everywhere", async () => {
+      for (const file of ["a.txt", "b.txt", "c.txt"]) {
+        fs.writeFileSync(path.join(workDir, file), "seed", "utf-8");
+      }
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const engine = makeEngine(gatedSpec("full"), dispatch);
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.lane).toBe("full");
+      expect(dispatch.calls[0]!.lane).toBe("full");
+      const persisted = readPersistedWorkflowSnapshot(snapshot.workflowId, { homeDir });
+      expect(persisted?.lane).toBe("full");
+    });
+
+    it("tags stage dispatches and the persisted snapshot with the triage lane", async () => {
+      // 3-file set without risk keywords → lane "standard"; the registry task
+      // record carries the same lane for watchdog attribution.
+      for (const file of ["a.txt", "b.txt", "c.txt"]) {
+        fs.writeFileSync(path.join(workDir, file), "seed", "utf-8");
+      }
+      const dispatch = new FakeDispatchService().script(() => okResult());
+      const engine = makeEngine(
+        {
+          name: "lane-tagged",
+          stages: [
+            {
+              name: "implement",
+              roles: ["worker"],
+              dispatch: { agent: "codex", taskTemplate: "Build the widget module" },
+              acceptance: {
+                commands: [`node -e "process.exit(0)"`],
+                files: ["a.txt", "b.txt", "c.txt"],
+              },
+            },
+          ],
+        },
+        dispatch,
+      );
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.lane).toBe("standard");
+      expect(dispatch.calls[0]!.lane).toBe("standard");
+      const persisted = readPersistedWorkflowSnapshot(snapshot.workflowId, { homeDir });
+      expect(persisted?.lane).toBe("standard");
+    });
+
+    it("records the lane on watchdog stall events for lane-tagged registry tasks", async () => {
+      // Regression for the background.ts stall-line lane attribution. Lives
+      // here because the Batch 2 #8 edit boundary excludes background.test.ts.
+      const registry = new BackgroundTaskRegistry({
+        homeDir,
+        eventBus: createAgentMeshEventBus(),
+      });
+      const taskId = "wf_lane_stall_s1_1";
+      registry.registerTask({
+        taskId,
+        pid: process.pid,
+        startedAtMs: 0,
+        outputFile: registry.outputFilePath(taskId),
+        lane: "standard",
+      });
+
+      // Silence past the 10-minute stall threshold → the watchdog appends the
+      // stall metrics line with the record's lane.
+      registry.checkStalledTasks(11 * 60_000);
+      const stall = readTaskMetrics({ homeDir }).find(
+        (record) => record.taskId === taskId && record.outcome === "stalled",
+      );
+      expect(stall?.lane).toBe("standard");
+
+      // Stop the watchdog timer before the temp home is removed.
+      registry.releaseTask(taskId);
+    });
+  });
+
+  // v0.5 Batch 2 #9 (design §5): fast-lane tree guard and seeded sampled
+  // review. The guard needs a real git work tree (repository evidence), so
+  // these tests init one in the temp cwd; the scripted fake dispatch plays the
+  // worker and simulates the file writes in-process.
+  describe("v0.5 Batch 2 #9 fast-lane tree guard + sampled review", () => {
+    const fastRequirements = {
+      source: "doc.md",
+      items: [
+        {
+          id: "R1",
+          ears: "The system SHALL build the widget",
+          kind: "unconditional" as const,
+          quote: "build the widget",
+          decidable: true,
+        },
+      ],
+    };
+
+    /** 1-file spec, R1 covered, no context plumbing, no risk keywords → fast. */
+    const makeFastSpec = (policy?: { maxReworkRounds: number }): WorkflowSpec => ({
+      name: "fastlane",
+      stages: [
+        {
+          name: "implement",
+          roles: ["worker"],
+          requirements: ["R1"],
+          dispatch: { agent: "codex", taskTemplate: "build the widget" },
+          acceptance: {
+            commands: [{ cmd: `node -e "process.exit(0)"`, covers: ["R1"] }],
+            files: ["expected.txt"],
+          },
+          ...(policy ? { policy } : {}),
+        },
+      ],
+    });
+
+    it("passes the tree guard when the worker stays inside the declared file set", async () => {
+      execSync("git init", { cwd: workDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(workDir, "expected.txt"), "seed", "utf-8");
+      const dispatch = new FakeDispatchService().script(() => {
+        // In-scope write only.
+        fs.writeFileSync(path.join(workDir, "expected.txt"), "built", "utf-8");
+        return okResult();
+      });
+      const engine = makeEngine(makeFastSpec(), dispatch, { requirements: fastRequirements });
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.lane).toBe("fast");
+      const stage = snapshot.stages[0]!;
+      expect(stage.treeGuard).toMatchObject({ checked: true, outOfScopePaths: [] });
+      expect(stage.treeGuard?.upgraded).toBeUndefined();
+      expect(dispatch.calls).toHaveLength(1);
+      expect(snapshot.laneEvents ?? []).toHaveLength(0);
+    });
+
+    it("upgrades in place to a reviewed run when the worker writes out of scope", async () => {
+      execSync("git init", { cwd: workDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(workDir, "expected.txt"), "seed", "utf-8");
+      const dispatch = new FakeDispatchService()
+        .script(() => {
+          // In-scope write PLUS an undeclared file → the guard must see it.
+          fs.writeFileSync(path.join(workDir, "expected.txt"), "built", "utf-8");
+          fs.writeFileSync(path.join(workDir, "unplanned.txt"), "boom", "utf-8");
+          return okResult();
+        })
+        .script(() => reviewResult("PASS"));
+      const engine = makeEngine(makeFastSpec(), dispatch, { requirements: fastRequirements });
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("done");
+      expect(snapshot.lane).toBe("fast");
+      const stage = snapshot.stages[0]!;
+      expect(stage.treeGuard).toMatchObject({
+        checked: true,
+        outOfScopePaths: ["unplanned.txt"],
+        upgraded: true,
+      });
+      // The upgrade dispatched a read-only review after the worker turn.
+      expect(dispatch.calls).toHaveLength(2);
+      expect(dispatch.calls[1]!.kind).toBe("review");
+      // The upgrade review inherits the stage's declared agent — real role
+      // resolution has no reviewer config to fall back on in the fast lane.
+      expect(dispatch.calls[1]!.agent).toBe("codex");
+      expect(dispatch.calls[1]!.task).toContain("outside the");
+      expect(dispatch.calls[1]!.task).toContain("unplanned.txt");
+      // The lane event is recorded for the ledger audit trail.
+      expect(snapshot.laneEvents).toHaveLength(1);
+      expect(snapshot.laneEvents![0]).toMatchObject({
+        stage: "implement",
+        event: "tree-guard-upgrade",
+      });
+      expect(snapshot.laneEvents![0]!.detail).toContain("unplanned.txt");
+      // The stage transitions show the in-place review insertion.
+      expect(stage.transitions.map((t) => t.status)).toEqual([
+        "pending",
+        "dispatched",
+        "running",
+        "acceptance",
+        "review",
+        "passed",
+      ]);
+    });
+
+    it("escalates when the tree-guard upgrade review still fails", async () => {
+      execSync("git init", { cwd: workDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(workDir, "expected.txt"), "seed", "utf-8");
+      const dispatch = new FakeDispatchService()
+        .script(() => {
+          fs.writeFileSync(path.join(workDir, "unplanned.txt"), "boom", "utf-8");
+          return okResult();
+        })
+        .script(() => reviewResult("FAIL"));
+      const engine = makeEngine(makeFastSpec({ maxReworkRounds: 0 }), dispatch, {
+        requirements: fastRequirements,
+      });
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("escalated");
+      expect(snapshot.stages[0]!.treeGuard).toMatchObject({
+        checked: true,
+        outOfScopePaths: ["unplanned.txt"],
+        upgraded: true,
+      });
+    });
+
+    it("forces a sampled post-acceptance review when the seeded sampler selects the stage", async () => {
+      execSync("git init", { cwd: workDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(workDir, "expected.txt"), "seed", "utf-8");
+      const dispatch = new FakeDispatchService()
+        .script(() => okResult())
+        .script(() => reviewResult("PASS"));
+      const engine = makeEngine(makeFastSpec(), dispatch, {
+        requirements: fastRequirements,
+        // rate 1 → always sampled; deterministic by construction.
+        samplingRate: 1,
+      });
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("done");
+      const stage = snapshot.stages[0]!;
+      expect(stage.sampleReview).toMatchObject({ verdict: "PASS" });
+      expect(dispatch.calls).toHaveLength(2);
+      expect(dispatch.calls[1]!.kind).toBe("review");
+      // The sampled audit inherits the stage's declared agent — real role
+      // resolution has no reviewer config to fall back on in the fast lane.
+      expect(dispatch.calls[1]!.agent).toBe("codex");
+      expect(dispatch.calls[1]!.task).toContain("Sampled post-acceptance review");
+      expect(snapshot.laneEvents).toHaveLength(1);
+      expect(snapshot.laneEvents![0]).toMatchObject({
+        stage: "implement",
+        event: "sampled-review",
+      });
+    });
+
+    it("fails closed when the sampled review returns a non-PASS verdict", async () => {
+      execSync("git init", { cwd: workDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(workDir, "expected.txt"), "seed", "utf-8");
+      const dispatch = new FakeDispatchService()
+        .script(() => okResult())
+        .script(() => reviewResult("FAIL", { findings: [] }));
+      const engine = makeEngine(makeFastSpec(), dispatch, {
+        requirements: fastRequirements,
+        samplingRate: 1,
+      });
+
+      const snapshot = await engine.run();
+
+      expect(snapshot.status).toBe("escalated");
+      expect(snapshot.stages[0]!.sampleReview).toMatchObject({ verdict: "FAIL" });
+      expect(snapshot.evidence?.reason).toContain("Sampled post-acceptance review returned FAIL");
     });
   });
 

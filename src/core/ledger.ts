@@ -66,6 +66,12 @@ export interface ReconciliationLedger {
   unknownIds: string[];
   /** Requirement ids never declared by any stage (no evidence path possible). */
   uncoveredIds: string[];
+  /**
+   * Batch 2 #9 lane events (design §5: 升道事件记入 ledger anomalies) plus any
+   * fail-closed pre-dispatch gate errorCode — the audit trail for mid-run
+   * lane changes and gateway rulings.
+   */
+  anomalies: string[];
   generatedAt: string;
 }
 
@@ -207,6 +213,13 @@ export function buildLedger(params: BuildLedgerParams & { nowIso: string }): Rec
         requirements.items.length,
   };
 
+  const anomalies: string[] = (snapshot.laneEvents ?? []).map(
+    (event) => `lane:${event.stage}:${event.event} — ${event.detail}`,
+  );
+  if (snapshot.failure?.errorCode) {
+    anomalies.push(`gate:${snapshot.failure.errorCode} — ${snapshot.failure.reason}`);
+  }
+
   return {
     workflowId: params.workflowId,
     workflowName: spec.name,
@@ -214,6 +227,7 @@ export function buildLedger(params: BuildLedgerParams & { nowIso: string }): Rec
     invariant,
     unknownIds: [...declaredIds].filter((id) => !knownIds.has(id)).sort(),
     uncoveredIds: [...knownIds].filter((id) => !declaredIds.has(id)).sort(),
+    anomalies,
     generatedAt: params.nowIso,
   };
 }

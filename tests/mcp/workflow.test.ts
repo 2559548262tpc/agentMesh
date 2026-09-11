@@ -9,6 +9,7 @@ import { BackgroundDispatchService } from "../../src/mcp/tools.js";
 import { BackgroundTaskRegistry } from "../../src/core/background.js";
 import { CheckpointStore } from "../../src/core/checkpoint.js";
 import { createAgentMeshEventBus } from "../../src/core/events.js";
+import { shouldSampleStage } from "../../src/core/triage.js";
 import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
@@ -77,12 +78,14 @@ interface WorkflowPayload {
   workflowId?: string;
   status?: string;
   name?: string;
+  lane?: string;
   stages?: Array<{
     name: string;
     status: string;
     tasks?: Array<{ taskId: string; status: string }>;
     review?: { verdict?: string; rounds?: Array<{ reviewOutcome: string }> };
     acceptance?: { ok?: boolean };
+    sampleReview?: { verdict?: string; findings?: unknown[] };
   }>;
   stages_listed?: string[];
   ledgerRef?: string;
@@ -408,6 +411,101 @@ describe("mcp/workflow protocol integration (run_workflow + get_workflow)", () =
       });
       expect(ledger.invariant.ok).toBe(true);
       expect(resIsErrorFor(payload.status)).toBe(false);
+    });
+  });
+
+  describe("v0.5 Batch 2 fast-lane sampling override over MCP", () => {
+    const writeSingleRequirement = () => {
+      fs.writeFileSync(
+        path.join(workDir, "spec-doc.md"),
+        "# Spec\n\n- build the widget\n",
+        "utf-8",
+      );
+      fs.writeFileSync(
+        path.join(workDir, "requirements.json"),
+        JSON.stringify({
+          source: "spec-doc.md",
+          items: [
+            {
+              id: "R1",
+              ears: "The system SHALL build the widget",
+              kind: "unconditional",
+              quote: "build the widget",
+              decidable: true,
+            },
+          ],
+        }),
+        "utf-8",
+      );
+    };
+
+    const runFastWorkflow = async (name: string, samplingRate: number) => {
+      const launch = await client.callTool({
+        name: "run_workflow",
+        arguments: {
+          cwd: workDir,
+          requirementsPath: "requirements.json",
+          samplingRate,
+          spec: {
+            name,
+            stages: [
+              {
+                name: "implement",
+                roles: ["worker"],
+                requirements: ["R1"],
+                dispatch: { agent: "codex", taskTemplate: "Build it" },
+                acceptance: {
+                  commands: [{ cmd: `node -e "process.exit(0)"`, covers: ["R1"] }],
+                },
+              },
+            ],
+          },
+        },
+      });
+      expect(launch.isError).toBeFalsy();
+      const launched = parsePayload(launch);
+      let payload: WorkflowPayload = {};
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const res = await client.callTool({
+          name: "get_workflow",
+          arguments: { workflowId: launched.workflowId!, maxWaitMs: 2_000, detail: "full" },
+        });
+        payload = parsePayload(res);
+        if (payload.status !== "running") break;
+      }
+      expect(payload.status).toBe("done");
+      return payload;
+    };
+
+    it("runs the fast lane with the sampled review disabled via samplingRate: 0", async () => {
+      writeSingleRequirement();
+      const payload = await runFastWorkflow("fast-nosample", 0);
+      expect(payload.lane).toBe("fast");
+      const stage = payload.stages?.[0];
+      if (!stage) throw new Error("terminal snapshot carried no stage record");
+      expect(stage.acceptance).toMatchObject({ ok: true });
+      expect(stage.sampleReview).toBeUndefined();
+    });
+
+    it("clamps an out-of-band samplingRate (1) into the design band before the engine sees it", async () => {
+      writeSingleRequirement();
+      const payload = await runFastWorkflow("fast-clamped", 1);
+      expect(payload.lane).toBe("fast");
+      const stage = payload.stages?.[0];
+      if (!stage) throw new Error("terminal snapshot carried no stage record");
+      // The engine seed is the workflowId and the clamped engine rate is 0.2.
+      // An unclamped rate of 1 would force a sampled review on every stage, so
+      // the observed presence must equal the seeded 0.2 decision — which pins
+      // the clamp whenever the hash lands outside [0, 0.2).
+      const expected = shouldSampleStage({
+        seed: payload.workflowId!,
+        stage: "implement",
+        rate: 0.2,
+      });
+      expect(Boolean(stage.sampleReview)).toBe(expected);
+      if (expected) {
+        expect(stage.sampleReview).toMatchObject({ verdict: "PASS" });
+      }
     });
   });
 });

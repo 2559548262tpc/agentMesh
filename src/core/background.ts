@@ -9,6 +9,7 @@ import {
   taskResultFilePath,
 } from "./storage.js";
 import { appendTaskMetrics } from "./metrics.js";
+import type { WorkflowLane } from "./metrics.js";
 import { appendStallEvent } from "./health.js";
 import type { AgentMeshEventBus } from "./events.js";
 
@@ -48,6 +49,9 @@ export const MAX_RETAINED_ORPHANS = 100;
 
 /** How often the stalled watchdog inspects active tasks while any exist. */
 export const WATCHDOG_INTERVAL_MS = 30_000;
+
+/** Lane value guard for registry lines (mirrors the TaskMetrics lane union in metrics.ts). */
+const REGISTRY_LANE_VALUES: readonly WorkflowLane[] = ["fast", "standard", "gated", "full"];
 
 /** Wait between two output-file polls inside one poll_task call. */
 export const POLL_INTERVAL_MS = 100;
@@ -104,6 +108,12 @@ export interface BackgroundTaskRecord {
   deps?: string[];
   /** Actual execution start instant (epoch ms); differs from startedAtMs when queued first. */
   dispatchedAtMs?: number;
+  /**
+   * v0.5 Batch 2 #8 triage lane (design §5), stamped by the workflow engine at
+   * registration so the watchdog stall metrics line can attribute the lane.
+   * Absent for dispatches outside a workflow run (direct MCP delegate_task).
+   */
+  lane?: WorkflowLane;
 }
 
 /** Terminal outcome written by the completion callback to <taskId>.result.json. */
@@ -280,6 +290,9 @@ function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
     ) {
       return undefined;
     }
+    // Lane guard mirrors the TaskMetrics lane union (metrics.ts); old registry
+    // lines predate the field and keep it absent.
+    const parsedLane = REGISTRY_LANE_VALUES.find((lane) => lane === candidate.lane);
     return {
       taskId: candidate.taskId,
       pid: candidate.pid,
@@ -301,6 +314,7 @@ function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
       ...(typeof candidate.dispatchedAtMs === "number"
         ? { dispatchedAtMs: candidate.dispatchedAtMs }
         : {}),
+      ...(parsedLane ? { lane: parsedLane } : {}),
     };
   } catch {
     return undefined;
@@ -823,10 +837,13 @@ export class BackgroundTaskRegistry {
         this._eventBus?.emit({ type: "task.stalled", taskId });
         // M0 metrics: the watchdog is the only stall observer, so it appends
         // the stall event line (role/agent/model unknown at this point; the
-        // aggregator attributes it to the dispatch record via taskId).
+        // aggregator attributes it to the dispatch record via taskId). The
+        // Batch 2 #8 triage lane rides along when the workflow engine stamped
+        // it on the registry record.
         appendTaskMetrics(
           {
             taskId,
+            ...(record.lane ? { lane: record.lane } : {}),
             outcome: "stalled",
             stallEvents: 1,
             tokensIn: 0,

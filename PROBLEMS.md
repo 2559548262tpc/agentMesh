@@ -814,3 +814,13 @@
 **解决方法**：① summary 回退链对 JSONL 类 stdout（首行可 JSON.parse 且含 `type` 字段）不做逐行挑选，直接返回角色化占位说明（如 "no normalized answer produced (0 text events)"）；② 或适配器在 parsedAny=true 且 answers 为空时于 result 上显式携带 `emptyReason`，normalizeResult 优先消费它；③ 排障侧：reviewer UNKNOWN + exitCode 0 + summary 为 JSON 碎片三特征齐现时，应直接怀疑 vendor 零 text 输出（本条为诊断捷径，非代码修复）。
 
 **状态**：已修复（2026-09-08）——`parseOpenCodeJsonLines` 在"解析到事件流但零 text 回答"时显式携带 `normalizedEmpty: true`；适配器结果链路消费该信号，summary 用角色化占位符 `OPENCODE_NO_ANSWER_PLACEHOLDER`（"(no normalized answer produced: the vendor run emitted 0 text events)"）替代原始 stdout，并追加 P-081 warning 说明，JSONL 事件碎片不再冒充人类可读摘要。同轮次姊妹问题（nemotron reviewer 零 text 输出本身是免费档模型行为不稳定）维持原诊断：换 reviewer 模型（mimo-v2.5-free）后正常，属模型选型问题非代码缺陷。
+
+## P-082 快车道审计派发缺 agent 声明，Fake 通道单测掩盖真实角色解析失败（v0.5 Batch 2 MCP 协议测试发现）
+
+**问题**：v0.5 Batch 2 快车道（#9）的 sampled review 与 tree guard 升道初评在真实 MCP 路径下必然失败：派发请求未携带 `agent` 字段，`BackgroundDispatchService` 角色解析按"显式 agent > 角色 config 绑定"顺序查找，快车道 spec 通常没有 reviewer 角色配置，解析报错 "No agent was provided and role 'reviewer' is not configured in '<cwd>/.agentmesh/config.json'"，结果 `reviewOutcome=UNKNOWN` → fail-closed 升级，抽检/升道安全网在真实使用中 100% 误伤正常通过的 stage。核心引擎单测（FakeDispatchService 脚本化派发）不解析 agent，测试全绿——缺陷被测试通道掩盖，直到 MCP 协议测试（真实 BackgroundDispatchService + InMemoryTransport）以 ~20% 概率命中抽样才暴露。
+
+**根因**：三处评审派发请求构建不完整——`runSampledReview` 与 `runTreeGuard` 升道初评漏传 `stageSpec.dispatch.agent`，而同文件 rework 循环的 re-review（L1491 附近）正确传了；快车道没有独立 reviewer stage 可供继承，agent 声明只能来自 worker stage 的 `dispatch.agent`。深层原因是"Fake 通道等价于真实派发路径"的假设不成立：凡是真实路径会做的解析/校验（角色绑定、schema、权限），Fake 脚本都跳过，通道级差异必须由协议测试兜底。
+
+**解决方法**：① `runSampledReview` 与 `runTreeGuard` 的 review 派发请求补上 `...(stageSpec.dispatch.agent ? { agent: stageSpec.dispatch.agent } : {})`（与 re-review 写法对齐）；② 确定性回归：核心单测在抽检（samplingRate:1）与升道用例中断言 `dispatch.calls[1].agent === "codex"`；MCP 协议测试新增 `samplingRate` 透传用例（0 禁用 + 越界值夹紧 0.1-0.2）覆盖真实派发路径。
+
+**状态**：已修复（2026-09-11，v0.5 Batch 2 收口）。教训：新增派发路径时 agent/role/cwd 三要素必须显式核对；Fake 通道只测编排逻辑，通道级协议测试不可省。
